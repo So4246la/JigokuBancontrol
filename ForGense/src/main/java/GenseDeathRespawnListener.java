@@ -25,29 +25,32 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
         getLogger().info("GenseDeathRespawnListenerが無効になりました。");
     }
 
-    @Override
-    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
-        if (!CHANNEL.equals(channel)) return;
+@Override
+public void onPluginMessageReceived(String channel, Player player, byte[] message) {
+    if (!CHANNEL.equals(channel)) return;
 
-        ByteArrayDataInput in = ByteStreams.newDataInput(message);
-        String sub = in.readUTF();
+    ByteArrayDataInput in = ByteStreams.newDataInput(message);
+    String sub = in.readUTF();
 
-        switch (sub) {
-            case "death_respawn":
-                triggerFakeRespawnEvent(player);
-                break;
+    switch (sub) {
+        case "death_respawn":
+            // プレイヤーを強制的に死亡状態にする
+            forceKillPlayer(player);
+            break;
 
-            case "death":
-                String uuid = in.readUTF();
-                String deathMessage = in.readUTF();
-                Bukkit.broadcastMessage("§c[地獄での死亡] " + deathMessage);
-                break;
-        }
+        case "death":
+            String uuid = in.readUTF();
+            String deathMessage = in.readUTF();
+            Bukkit.broadcastMessage("§c[地獄での死亡] " + deathMessage);
+            break;
     }
+}
 
-    private void triggerFakeRespawnEvent(Player player) {
-        Location respawnLocation = player.getLocation();
-        PlayerRespawnEvent fakeRespawnEvent = new PlayerRespawnEvent(player, respawnLocation, false);
-        Bukkit.getPluginManager().callEvent(fakeRespawnEvent);
-    }
+// プレイヤーを強制的に死亡させるメソッド
+private void forceKillPlayer(Player player) {
+    // 安全にプレイヤーを即死させ、通常の死亡処理をトリガーする
+    Bukkit.getScheduler().runTask(this, () -> {
+        player.setHealth(0.0);
+    });
+  }
 } 
