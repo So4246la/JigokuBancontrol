@@ -71,10 +71,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         if (!CHANNEL.equals(channel)) return;
 
         // "death_respawn" サブチャンネル受信時の処理
-        String sub = new String(message, java.nio.charset.StandardCharsets.UTF_8);
-        if ("death_respawn".equals(sub)) {
-            triggerFakeRespawnEvent(player);
-        }
+        // この処理はGenseサーバー側で行うため、Jigokuサーバーでは不要
 
         // 既存の get_time 処理
         try (java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(message))) {

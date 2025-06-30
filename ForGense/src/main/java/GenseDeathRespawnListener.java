@@ -8,7 +8,9 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
 
 import com.google.common.io.ByteArrayDataInput;
+import com.google.common.io.ByteArrayDataOutput;
 import com.google.common.io.ByteStreams;
+
 
 public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessageListener {
 
@@ -40,8 +42,16 @@ public void onPluginMessageReceived(String channel, Player player, byte[] messag
 
         case "death":
             String uuid = in.readUTF();
-            String deathMessage = in.readUTF();
+            String deathMessage = in.readUTF(); // deathMessageも読み込む
             Bukkit.broadcastMessage("§c[地獄での死亡] " + deathMessage);
+            break;
+
+        case "query_gamemode":
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("gamemode_response");
+            out.writeUTF(player.getUniqueId().toString());
+            out.writeUTF(player.getGameMode().name()); // ゲームモードを送信
+            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
             break;
     }
 }
@@ -53,4 +63,4 @@ private void forceKillPlayer(Player player) {
         player.setHealth(0.0);
     });
   }
-} 
+}
