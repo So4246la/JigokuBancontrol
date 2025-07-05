@@ -1,0 +1,7 @@
+{
+  "id": "bancontrol",
+  "name": "BanControl",
+  "version": "1.0",
+  "main": "jp.example.bancontrol.BanControlPlugin",
+  "authors": ["So4246la"]
+}

@@ -1,0 +1,17 @@
+# サーバー名
+jigoku_server_name = "jigoku"
+gense_server_name = "gense"
+
+# 制限時間（分）
+ban_after_death_minutes = 15
+ban_after_night_logout_minutes = 60
+
+# メッセージ
+ban_after_death_notice = "地獄で死亡したため、あと{minutes}分は地獄に戻れません。"
+ban_after_night_logout_notice = "夜に地獄からログアウトしたため、あと{minutes}分は地獄に戻れません。"
+move_denied_jigoku = "地獄サーバーには夜間以外のみ移動できます。"
+move_denied_gense = "現世サーバーには今は移動できません。"
+
+# 昼夜切替アナウンス
+jigoku_night_message = "どこかから地鳴りが響いてくる…（地獄ワールドが夜になりました）"
+jigoku_day_message = "地鳴りは止んだ様だ...(地獄ワールドの夜が明けました)"
