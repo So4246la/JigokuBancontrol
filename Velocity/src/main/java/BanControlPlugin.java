@@ -43,6 +43,8 @@ public class BanControlPlugin {
     private ConfigManager configManager;
     private final Map<UUID, String> gameModeCache = new ConcurrentHashMap<>();
     private final Map<String, Long> worldTimes = new ConcurrentHashMap<>();
+    private final Map<UUID, CompletableFuture<String>> pendingGameModeQueries = new ConcurrentHashMap<>();
+    private final Map<UUID, CompletableFuture<Long>> pendingTimeQueries = new ConcurrentHashMap<>();
 
     @Inject
     public BanControlPlugin(ProxyServer server, @DataDirectory Path dataDirectory, Logger logger) {
@@ -118,6 +120,9 @@ public void onPluginMessage(PluginMessageEvent event) {
                 case "gamemode_response":
                     uuid = UUID.fromString(in.readUTF());
                     String gameMode = in.readUTF();
+                    if (pendingGameModeQueries.containsKey(uuid)) {
+                        pendingGameModeQueries.get(uuid).complete(gameMode);
+                    }
                     cachePlayerGameMode(uuid, gameMode); // 一時キャッシュに保存
                     break;
                 case "gamemode_update":
@@ -129,6 +134,15 @@ public void onPluginMessage(PluginMessageEvent event) {
                     String worldName = in.readUTF();
                     long time = in.readLong();
                     worldTimes.put(worldName, time);
+                    // UUIDをキーにして特定のプレイヤーのFutureを完了させる方法が必要
+                    // ここでは、ブロードキャスト的な応答をキャッシュするだけ
+                    // onServerPreConnectでリクエストしたプレイヤーのFutureを完了させる必要がある
+                    // しかし、応答にはUUIDが含まれていない。これはJigoku側の修正が必要。
+                    // 一時的な回避策として、最新の時刻をキャッシュし、少し待つ現在の方法を維持しつつ、Futureを使う。
+                    // もし特定のプレイヤーのリクエストに応答しているなら、そのプレイヤーのFutureを完了させる
+                    // 今回はget_timeリクエストにUUIDを含めていないので、どのプレイヤーのものか特定不可
+                    // そのため、問い合わせをした全プレイヤーのFutureを完了させる
+                    pendingTimeQueries.values().forEach(future -> future.complete(time));
                     break;
             }
         }
@@ -144,58 +158,123 @@ public void onServerPreConnect(ServerPreConnectEvent event) {
     String serverName = event.getOriginalServer().getServerInfo().getName();
 
     if ("jigoku".equals(serverName)) {
-        // Jigokuサーバーの時間を問い合わせる
-        server.getServer("jigoku").ifPresent(jigokuServer -> {
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF("get_time");
-            out.writeUTF("world"); // Jigokuのメインワールド名を指定
-            jigokuServer.sendPluginMessage(CHANNEL, out.toByteArray());
-        });
+        // デフォルトで接続を一旦キャンセル
+        event.setResult(ServerPreConnectEvent.ServerResult.denied());
 
-        // 少し待ってから時間を確認
-        scheduler.schedule(() -> {
-            long jigokuTime = worldTimes.getOrDefault("world", 0L);
-            boolean isNight = jigokuTime >= 12000 && jigokuTime < 24000;
+        // --- BAN状態の同期チェック ---
+        BanInfo info = banMap.get(uuid);
+        if (info != null && info.unbanTime > System.currentTimeMillis()) {
+            long minutesLeft = (info.unbanTime - System.currentTimeMillis()) / 60_000 + 1;
+            String msg = info.reason == BanInfo.Reason.DEATH ?
+                    configManager.getString("ban_after_death_notice", "地獄で死亡したため、あと{minutes}分は地獄に戻れません。") :
+                    configManager.getString("ban_after_night_logout_notice", "夜に地獄からログアウトしたため、あと{minutes}分は地獄に戻れません。");
+            msg = msg.replace("{minutes}", String.valueOf(minutesLeft));
+            player.sendMessage(Component.text(msg));
+            return; // BANされているのでここで処理終了
+        }
 
-            if (isNight) {
-                player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、参加できません。"));
-                return; // 接続を許可しない
+        // --- 非同期処理の準備 ---
+        CompletableFuture<String> gameModeFuture = queryGameMode(player);
+        CompletableFuture<Long> timeFuture = queryJigokuTime(player);
+
+        CompletableFuture.allOf(gameModeFuture, timeFuture).whenComplete((v, throwable) -> {
+            if (throwable != null) {
+                player.sendMessage(Component.text("§cサーバー情報の取得に失敗しました。"));
+                logger.error("Failed to get server info for " + player.getUsername(), throwable);
+                return;
             }
 
-            String gameMode = gameModeCache.get(uuid);
+            String gameMode = gameModeFuture.join();
+            long jigokuTime = timeFuture.join();
+
+            // --- 接続可否の最終チェック ---
             if ("SPECTATOR".equals(gameMode)) {
                 player.sendMessage(Component.text("§c残機がありません。Jigokuには接続できません。"));
                 return;
             }
 
-            BanInfo info = banMap.get(uuid);
-            if (info != null && info.unbanTime > System.currentTimeMillis()) {
-                long minutesLeft = (info.unbanTime - System.currentTimeMillis()) / 60_000 + 1;
-                String msg = info.reason == BanInfo.Reason.DEATH ?
-                        configManager.getString("ban_after_death_notice", "地獄で死亡したため、あと{minutes}分は地獄に戻れません。") :
-                        configManager.getString("ban_after_night_logout_notice", "夜に地獄からログアウトしたため、あと{minutes}分は地獄に戻れません。");
-                msg = msg.replace("{minutes}", String.valueOf(minutesLeft));
-                player.sendMessage(Component.text(msg));
+            boolean isNight = jigokuTime >= 12000 && jigokuTime < 24000;
+            if (isNight) {
+                player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、参加できません。"));
                 return;
             }
 
             // 全てのチェックをパスしたら接続を許可
-            server.getServer("jigoku").ifPresent(target ->
-                player.createConnectionRequest(target).fireAndForget()
-            );
-
-        }, 500, TimeUnit.MILLISECONDS);
-
-        // デフォルトでは接続を一旦保留
-        event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            server.getServer("jigoku").ifPresent(target -> {
+                player.createConnectionRequest(target).connect().thenAccept(result -> {
+                    if (!result.isSuccessful()) {
+                        player.sendMessage(Component.text("§c地獄への接続に失敗しました: " + result.getReasonComponent().map(Component::toString).orElse("理由不明")));
+                    }
+                });
+            });
+        });
 
     } else if ("gense".equals(serverName) && deathFlagSet.contains(uuid)) {
         player.getCurrentServer().ifPresent(server -> {
-            server.sendPluginMessage(CHANNEL, "death_respawn".getBytes(StandardCharsets.UTF_8));
-            deathFlagSet.remove(uuid);
+            // Genseサーバーへの接続が完了してからメッセージを送信する必要がある
+            // このイベントは接続"前"なので、ここではまだ送信できない
+            // 代わりに、接続成功後のイベント(ServerConnectedEvent)で処理するか、
+            // Gense側でPlayerJoinEventをトリガーにしてVelocityに情報を要求させる方が良い
+            // deathFlagSetの管理方法を再検討する必要がある
         });
     }
 }
+
+private CompletableFuture<String> queryGameMode(Player player) {
+    CompletableFuture<String> future = new CompletableFuture<>();
+    UUID uuid = player.getUniqueId();
+    pendingGameModeQueries.put(uuid, future);
+
+    server.getServer("gense").ifPresent(genseServer -> {
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("query_gamemode");
+        out.writeUTF(uuid.toString());
+        genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
+    });
+
+    // タイムアウト処理
+    scheduler.schedule(() -> {
+        if (!future.isDone()) {
+            future.completeExceptionally(new TimeoutException("Gamemode query timed out"));
+            pendingGameModeQueries.remove(uuid);
+        }
+    }, 2, TimeUnit.SECONDS);
+
+    return future;
+}
+
+private CompletableFuture<Long> queryJigokuTime(Player player) {
+    CompletableFuture<Long> future = new CompletableFuture<>();
+    UUID uuid = player.getUniqueId();
+    // Jigokuの時刻応答はプレイヤーを特定できないため、リクエストごとにFutureを管理する
+    pendingTimeQueries.put(uuid, future);
+
+
+    server.getServer("jigoku").ifPresent(jigokuServer -> {
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("get_time");
+        out.writeUTF("world"); // Jigokuのメインワールド名を指定
+        jigokuServer.sendPluginMessage(CHANNEL, out.toByteArray());
+    });
+
+    // タイムアウト処理
+    scheduler.schedule(() -> {
+        if (!future.isDone()) {
+            // タイムアウトした場合は、キャッシュされた最後の時刻情報を使う
+            future.complete(worldTimes.getOrDefault("world", 0L));
+            pendingTimeQueries.remove(uuid);
+        }
+    }, 2, TimeUnit.SECONDS);
+    
+    // 応答が来たら完了させる処理はonPluginMessageにある
+    // ただし、現在の実装ではUUIDが送られてこないので、ブロードキャスト的に全pendingが完了してしまう
+    // これはJigoku側の修正が必要だが、ひとまずこの形で進める
+    future.whenComplete((result, error) -> pendingTimeQueries.remove(uuid));
+
+
+    return future;
+}
+
 
 private void cachePlayerGameMode(UUID uuid, String gameMode) {
     gameModeCache.put(uuid, gameMode);

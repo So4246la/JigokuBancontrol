@@ -40,6 +40,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private FileConfiguration dataConfig;
     private final Random random = new Random();
     private int spawnRange = 1000; // スポーン範囲（中心からの距離）
+    private boolean wasNight = false; // 最後にチェックした時の夜かどうかを保持
 
     private boolean isNight(World world) {
         long time = world.getTime();
@@ -54,12 +55,27 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
         spawnRange = config.getInt("spawn-range", 1000);
 
         Bukkit.getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
-        Bukkit.getMessenger().registerOutgoingPluginChannel(this, "BungeeCord"); // チャンネル登録を追加
         Bukkit.getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
         Bukkit.getPluginManager().registerEvents(this, this);
         getLogger().info("JigokuBanControlが有効になりました。");
         setupDataFile();
         loadData();
+
+        // 昼夜の切り替わりを監視するタスク
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            World world = getServer().getWorlds().get(0); // メインワールドを想定
+            if (world != null) {
+                boolean isCurrentlyNight = isNight(world);
+                if (isCurrentlyNight && !wasNight) {
+                    sendTimeStateToProxy("jigoku_night");
+                    wasNight = true;
+                }
+                if (!isCurrentlyNight && wasNight) {
+                    sendTimeStateToProxy("jigoku_day");
+                    wasNight = false;
+                }
+            }
+        }, 0L, 100L); // 5秒ごとにチェック (100 ticks)
     }
 
     @Override
@@ -143,15 +159,11 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     public void onPlayerQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
         if (isNight(player.getWorld())) {
-            try (ByteArrayOutputStream out = new ByteArrayOutputStream();
-                 DataOutputStream data = new DataOutputStream(out)) {
-                data.writeUTF("night_logout");
-                data.writeUTF(player.getUniqueId().toString());
-                player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-            } catch (IOException e) {
-                getLogger().warning("夜間ログアウト通知の送信中にエラーが発生しました。");
-                e.printStackTrace();
-            }
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("night_logout");
+            out.writeUTF(player.getUniqueId().toString());
+            // プレイヤーオブジェクト経由で送信
+            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
         }
     }
 
@@ -220,58 +232,56 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             Material blockType = world.getBlockAt(x, y - 1, z).getType();
 
             if (blockType != Material.WATER && blockType != Material.LAVA && blockType != Material.POWDER_SNOW) {
-                return new Location(world, x + 0.5, y + 1.0, z + 0.5);
+                return new Location(world, x, y, z);
             }
         }
         // 10回試行してダメならデフォルト位置
         return new Location(world, 0, world.getHighestBlockYAt(0, 0) + 1, 0);
     }
 
-    @Override
-    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
-        if (!CHANNEL.equals(channel)) return;
-
-        // "death_respawn" サブチャンネル受信時の処理
-        // この処理はGenseサーバー側で行うため、Jigokuサーバーでは不要
-
-        // 既存の get_time 処理
-        try (java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(message))) {
-            String request = in.readUTF();
-            if ("get_time".equals(request)) {
-                String worldName = in.readUTF();
-                World world = Bukkit.getWorld(worldName);
-                if (world != null) {
-                    long time = world.getTime();
-                    try (ByteArrayOutputStream out = new ByteArrayOutputStream();
-                         DataOutputStream data = new DataOutputStream(out)) {
-                        data.writeUTF("time_response");
-                        data.writeUTF(worldName);
-                        data.writeLong(time);
-                        player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-                    }
-                }
-            }
-        } catch (IOException e) {
-            getLogger().warning("PluginMessage受信中にエラーが発生しました。");
-            e.printStackTrace();
-        }
-    }
-
     private void connectToServer(Player player, String serverName) {
         ByteArrayDataOutput out = ByteStreams.newDataOutput();
         out.writeUTF("Connect");
         out.writeUTF(serverName);
-        // BungeeCordチャンネルはVelocityでもサポートされている
         player.sendPluginMessage(this, "BungeeCord", out.toByteArray());
     }
 
-    // 擬似リスポーンイベントを手動で呼ぶ
-    private void triggerFakeRespawnEvent(Player player) {
-        // 現在位置をそのままリスポーン先とする
-        Location respawnLocation = player.getLocation();
+    private void sendTimeStateToProxy(String state) {
+        // オンラインのプレイヤーがいないと送信できないため、いるか確認
+        if (getServer().getOnlinePlayers().isEmpty()) {
+            return; // 誰もいなければ送信しない
+        }
 
-        // 疑似的にPlayerRespawnEventを呼び出す
-        PlayerRespawnEvent fakeRespawnEvent = new PlayerRespawnEvent(player, respawnLocation, false);
-        Bukkit.getPluginManager().callEvent(fakeRespawnEvent);
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF(state);
+
+        // 最初に見つかったプレイヤー経由でメッセージを送信する
+        Player sender = getServer().getOnlinePlayers().iterator().next();
+        sender.sendPluginMessage(this, CHANNEL, out.toByteArray());
+        getLogger().info(state + " メッセージをVelocityに送信しました。");
+    }
+
+    @Override
+    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
+        if (!channel.equals(CHANNEL)) {
+            return;
+        }
+
+        com.google.common.io.ByteArrayDataInput in = ByteStreams.newDataInput(message);
+        String subchannel = in.readUTF();
+
+        if (subchannel.equals("get_time")) {
+            String worldName = in.readUTF();
+            World world = Bukkit.getWorld(worldName);
+            if (world != null) {
+                long time = world.getTime();
+                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                out.writeUTF("jigoku_time_response");
+                out.writeUTF(worldName);
+                out.writeLong(time);
+                // Velocityからのリクエストなので、player経由で返信
+                player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+            }
+        }
     }
 }
