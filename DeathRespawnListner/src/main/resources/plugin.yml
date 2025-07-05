@@ -1,0 +1,4 @@
+name: GenseDeathRespawnListener
+version: '1.0'
+main: GenseDeathRespawnListener
+api-version: '1.19'

@@ -3,6 +3,8 @@ package jp.example.jigokubancontrol;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -10,8 +12,15 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.Material;
+
 import java.util.Random;
 import java.util.UUID;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.stream.Collectors;
 import com.google.common.io.ByteArrayDataOutput;
 import com.google.common.io.ByteStreams;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -19,11 +28,18 @@ import org.bukkit.plugin.messaging.PluginMessageListener;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
+import java.io.File;
 import java.io.IOException;
 
 public class JigokuBanControlPlugin extends JavaPlugin implements Listener, PluginMessageListener {
 
     private static final String CHANNEL = "myserver:bancontrol";
+    private final Set<UUID> deadPlayers = new HashSet<>();
+    private final Set<UUID> joinedPlayers = new HashSet<>();
+    private File dataFile;
+    private FileConfiguration dataConfig;
+    private final Random random = new Random();
+    private int spawnRange = 1000; // スポーン範囲（中心からの距離）
 
     private boolean isNight(World world) {
         long time = world.getTime();
@@ -32,10 +48,72 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
 
     @Override
     public void onEnable() {
+        // 設定ファイルをロード
+        saveDefaultConfig();
+        FileConfiguration config = getConfig();
+        spawnRange = config.getInt("spawn-range", 1000);
+
         Bukkit.getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
+        Bukkit.getMessenger().registerOutgoingPluginChannel(this, "BungeeCord"); // チャンネル登録を追加
         Bukkit.getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
         Bukkit.getPluginManager().registerEvents(this, this);
         getLogger().info("JigokuBanControlが有効になりました。");
+        setupDataFile();
+        loadData();
+    }
+
+    @Override
+    public void onDisable() {
+        saveData();
+    }
+
+    private void setupDataFile() {
+        if (!getDataFolder().exists()) {
+            getDataFolder().mkdirs();
+        }
+        dataFile = new File(getDataFolder(), "data.yml");
+        if (!dataFile.exists()) {
+            try {
+                dataFile.createNewFile();
+            } catch (IOException e) {
+                getLogger().log(Level.SEVERE, "data.ymlの作成に失敗しました。", e);
+            }
+        }
+        dataConfig = YamlConfiguration.loadConfiguration(dataFile);
+    }
+
+    private void loadData() {
+        List<String> deadUuids = dataConfig.getStringList("dead-players");
+        for (String uuidString : deadUuids) {
+            try {
+                deadPlayers.add(UUID.fromString(uuidString));
+            } catch (IllegalArgumentException e) {
+                getLogger().warning("無効なUUID文字列をdata.ymlから読み込みました: " + uuidString);
+            }
+        }
+        List<String> joinedUuids = dataConfig.getStringList("joined-players");
+        for (String uuidString : joinedUuids) {
+            try {
+                joinedPlayers.add(UUID.fromString(uuidString));
+            } catch (IllegalArgumentException e) {
+                getLogger().warning("無効なUUID文字列をdata.ymlから読み込みました: " + uuidString);
+            }
+        }
+    }
+
+    private void saveData() {
+        if (dataConfig == null || dataFile == null) {
+            return;
+        }
+        List<String> deadUuidStrings = deadPlayers.stream().map(UUID::toString).collect(Collectors.toList());
+        dataConfig.set("dead-players", deadUuidStrings);
+        List<String> joinedUuidStrings = joinedPlayers.stream().map(UUID::toString).collect(Collectors.toList());
+        dataConfig.set("joined-players", joinedUuidStrings);
+        try {
+            dataConfig.save(dataFile);
+        } catch (IOException e) {
+            getLogger().log(Level.SEVERE, "data.ymlの保存に失敗しました。", e);
+        }
     }
 
 @EventHandler
@@ -50,6 +128,15 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     out.writeUTF(deathMessage);          // ← デスログ転送用に追加
 
     player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+
+    // 死亡したプレイヤーを記録
+    deadPlayers.add(playerUUID);
+    saveData();
+
+    // 1秒後にgenseサーバーへ転送
+    Bukkit.getScheduler().runTaskLater(this, () -> {
+        connectToServer(player, "gense");
+    }, 20L);
 }
 
     @EventHandler
@@ -71,40 +158,73 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
+        UUID playerUUID = player.getUniqueId();
+
+        if (deadPlayers.contains(playerUUID)) {
+            // 死亡からの復帰の場合、ランダムな場所にテレポート
+            teleportToRandomLocation(player, "§cあなたは死から蘇り、見知らぬ場所へ飛ばされた...");
+            deadPlayers.remove(playerUUID);
+            if (!joinedPlayers.contains(playerUUID)) {
+                joinedPlayers.add(playerUUID);
+            }
+            saveData();
+        } else if (!joinedPlayers.contains(playerUUID)) {
+            // 初参加の場合、ランダムな場所にテレポート
+            teleportToRandomLocation(player, "§e地獄の世界へようこそ！");
+            joinedPlayers.add(playerUUID);
+            saveData();
+        } else {
+            // 通常の参加の場合
+            player.sendMessage("§e再び地獄の世界へようこそ！");
+        }
+    }
+
+    @EventHandler
+    public void onPlayerRespawn(PlayerRespawnEvent event) {
+        Player player = event.getPlayer();
+        World world = player.getWorld();
+
+        // 安全なリスポーン地点を取得
+        Location randomLocation = getSafeSpawnLocation(world);
+
+        // リスポーン地点をランダムな座標に設定
+        event.setRespawnLocation(randomLocation);
+
+        // テレポート後にメッセージを送信
+        Bukkit.getScheduler().runTask(this, () -> {
+            player.sendMessage("§c死の代償として、新たな場所に飛ばされた...");
+        });
+    }
+
+    private void teleportToRandomLocation(Player player, String welcomeMessage) {
         World world = player.getWorld();
         
-        // ランダムな座標を生成 (X: -1000～1000, Z: -1000～1000)
-        Random random = new Random();
-        int x = random.nextInt(2001) - 1000; // -1000 to 1000
-        int z = random.nextInt(2001) - 1000; // -1000 to 1000
-        int y = world.getHighestBlockYAt(x, z) + 1; // 地表の高さ + 1
-        
-        Location randomLocation = new Location(world, x + 0.5, y, z + 0.5);
-        
-        // WorldBorderをランダムに設定
-        setRandomWorldBorder(world, randomLocation, random);
+        // 安全なテレポート先を取得
+        Location randomLocation = getSafeSpawnLocation(world);
         
         // プレイヤーをランダムな座標にテレポート
         Bukkit.getScheduler().runTask(this, () -> {
             player.teleport(randomLocation);
-            player.sendMessage("§e地獄の世界へようこそ！ランダムな場所にスポーンしました。");
+            player.sendMessage(welcomeMessage);
         });
     }
-    
-    private void setRandomWorldBorder(World world, Location center, Random random) {
-        // ワールドボーダーのサイズをランダムに設定 (500～2000ブロック)
-        double borderSize = 500 + random.nextDouble() * 1500; // 500 to 2000
-        
-        // ワールドボーダーの中心をスポーン地点に設定
-        world.getWorldBorder().setCenter(center.getX(), center.getZ());
-        world.getWorldBorder().setSize(borderSize);
-        
-        // ワールドボーダーの警告距離とダメージを設定
-        world.getWorldBorder().setWarningDistance(50);
-        world.getWorldBorder().setDamageAmount(1.0);
-        world.getWorldBorder().setDamageBuffer(5.0);
-        
-        getLogger().info("ワールドボーダーを設定: 中心(" + center.getX() + ", " + center.getZ() + "), サイズ: " + borderSize);
+
+    private Location getSafeSpawnLocation(World world) {
+        if (world == null) {
+            world = Bukkit.getWorlds().get(0); 
+        }
+        for (int i = 0; i < 10; i++) {
+            int x = random.nextInt(spawnRange * 2) - spawnRange;
+            int z = random.nextInt(spawnRange * 2) - spawnRange;
+            int y = world.getHighestBlockYAt(x, z);
+            Material blockType = world.getBlockAt(x, y - 1, z).getType();
+
+            if (blockType != Material.WATER && blockType != Material.LAVA && blockType != Material.POWDER_SNOW) {
+                return new Location(world, x + 0.5, y + 1.0, z + 0.5);
+            }
+        }
+        // 10回試行してダメならデフォルト位置
+        return new Location(world, 0, world.getHighestBlockYAt(0, 0) + 1, 0);
     }
 
     @Override
@@ -135,6 +255,14 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             getLogger().warning("PluginMessage受信中にエラーが発生しました。");
             e.printStackTrace();
         }
+    }
+
+    private void connectToServer(Player player, String serverName) {
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("Connect");
+        out.writeUTF(serverName);
+        // BungeeCordチャンネルはVelocityでもサポートされている
+        player.sendPluginMessage(this, "BungeeCord", out.toByteArray());
     }
 
     // 擬似リスポーンイベントを手動で呼ぶ
