@@ -7,6 +7,7 @@ import com.google.common.io.ByteStreams;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
+import com.velocitypowered.api.event.player.ServerPostConnectEvent;
 import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.plugin.Plugin;
@@ -97,8 +98,9 @@ public void onPluginMessage(PluginMessageEvent event) {
                     uuid = UUID.fromString(in.readUTF());
                     banMap.put(uuid, new BanInfo(System.currentTimeMillis() + configManager.getInt("ban_after_death_minutes", 5) * 60_000, BanInfo.Reason.DEATH));
                     saveBans();
+                    deathFlagSet.add(uuid); // Gense接続時に死亡処理を行うためフラグを立てる
 
-                    // ★ここにデスログ転送処理を追加
+                    // ★デスログ転送処理はGenseに任せる
                     server.getServer("gense").ifPresent(gense ->
                         gense.sendPluginMessage(event.getIdentifier(), dataForForwarding)
                     );
@@ -148,6 +150,26 @@ public void onPluginMessage(PluginMessageEvent event) {
         }
     } catch (Exception e) {
         e.printStackTrace();
+    }
+}
+
+@Subscribe
+public void onServerPostConnect(ServerPostConnectEvent event) {
+    Player player = event.getPlayer();
+    UUID uuid = player.getUniqueId();
+    String serverName = player.getCurrentServer().map(s -> s.getServerInfo().getName()).orElse("");
+
+    // Genseサーバーに接続し、かつdeathフラグが立っている場合
+    if ("gense".equals(serverName) && deathFlagSet.contains(uuid)) {
+        // Genseに擬似死亡を依頼
+        server.getServer("gense").ifPresent(genseServer -> {
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("death_respawn");
+            out.writeUTF(uuid.toString());
+            genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
+        });
+        // フラグを解除
+        deathFlagSet.remove(uuid);
     }
 }
 
@@ -210,13 +232,7 @@ public void onServerPreConnect(ServerPreConnectEvent event) {
         });
 
     } else if ("gense".equals(serverName) && deathFlagSet.contains(uuid)) {
-        player.getCurrentServer().ifPresent(server -> {
-            // Genseサーバーへの接続が完了してからメッセージを送信する必要がある
-            // このイベントは接続"前"なので、ここではまだ送信できない
-            // 代わりに、接続成功後のイベント(ServerConnectedEvent)で処理するか、
-            // Gense側でPlayerJoinEventをトリガーにしてVelocityに情報を要求させる方が良い
-            // deathFlagSetの管理方法を再検討する必要がある
-        });
+        // onServerPostConnectで処理するため、ここでは何もしない
     }
 }
 
