@@ -3,9 +3,13 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>jp.example</groupId>
+    <parent>
+        <groupId>jp.example</groupId>
+        <artifactId>jigokubancontrol-parent</artifactId>
+        <version>1.0</version>
+    </parent>
+
     <artifactId>bancontrol</artifactId>
-    <version>1.0</version>
     <packaging>jar</packaging>
 
     <name>BanControl</name>
@@ -16,8 +20,6 @@
         <dependency>
             <groupId>com.velocitypowered</groupId>
             <artifactId>velocity-api</artifactId>
-            <version>3.4.0-SNAPSHOT</version>
-            <scope>provided</scope>
         </dependency>
         <!-- Jackson (for JSON) -->
         <dependency>
@@ -25,23 +27,7 @@
             <artifactId>jackson-databind</artifactId>
             <version>2.17.1</version>
         </dependency>
-<dependency>
-  <groupId>com.velocitypowered</groupId>
-  <artifactId>velocity-api</artifactId>
-  <version>3.4.0-SNAPSHOT</version>
-  <scope>provided</scope>
-</dependency>
     </dependencies>
-<repositories>
-  <repository>
-    <id>velocity-snapshots</id>
-    <url>https://repo.velocitypowered.com/snapshots/</url>
-    <releases><enabled>false</enabled></releases>
-    <snapshots><enabled>true</enabled></snapshots>
-  </repository>
-</repositories>
-
-
 
     <build>
         <plugins>
@@ -49,15 +35,12 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.10.1</version>
                 <configuration>
-                    <source>17</source>
-                    <target>17</target>
                     <annotationProcessorPaths>
                         <path>
                             <groupId>com.velocitypowered</groupId>
                             <artifactId>velocity-api</artifactId>
-                            <version>3.4.0-SNAPSHOT</version>
+                            <version>${velocity.api.version}</version>
                         </path>
                     </annotationProcessorPaths>
                 </configuration>

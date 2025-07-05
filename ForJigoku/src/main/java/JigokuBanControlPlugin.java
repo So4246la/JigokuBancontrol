@@ -271,12 +271,14 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         String subchannel = in.readUTF();
 
         if (subchannel.equals("get_time")) {
+            String uuidString = in.readUTF(); // UUIDを受け取る
             String worldName = in.readUTF();
             World world = Bukkit.getWorld(worldName);
             if (world != null) {
                 long time = world.getTime();
                 ByteArrayDataOutput out = ByteStreams.newDataOutput();
                 out.writeUTF("jigoku_time_response");
+                out.writeUTF(uuidString); // UUIDを返信する
                 out.writeUTF(worldName);
                 out.writeLong(time);
                 // Velocityからのリクエストなので、player経由で返信
