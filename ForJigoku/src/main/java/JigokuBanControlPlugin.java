@@ -7,8 +7,10 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
+import java.util.Random;
 import java.util.UUID;
 import com.google.common.io.ByteArrayDataOutput;
 import com.google.common.io.ByteStreams;
@@ -64,6 +66,45 @@ public void onPlayerDeath(PlayerDeathEvent event) {
                 e.printStackTrace();
             }
         }
+    }
+
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        World world = player.getWorld();
+        
+        // ランダムな座標を生成 (X: -1000～1000, Z: -1000～1000)
+        Random random = new Random();
+        int x = random.nextInt(2001) - 1000; // -1000 to 1000
+        int z = random.nextInt(2001) - 1000; // -1000 to 1000
+        int y = world.getHighestBlockYAt(x, z) + 1; // 地表の高さ + 1
+        
+        Location randomLocation = new Location(world, x + 0.5, y, z + 0.5);
+        
+        // WorldBorderをランダムに設定
+        setRandomWorldBorder(world, randomLocation, random);
+        
+        // プレイヤーをランダムな座標にテレポート
+        Bukkit.getScheduler().runTask(this, () -> {
+            player.teleport(randomLocation);
+            player.sendMessage("§e地獄の世界へようこそ！ランダムな場所にスポーンしました。");
+        });
+    }
+    
+    private void setRandomWorldBorder(World world, Location center, Random random) {
+        // ワールドボーダーのサイズをランダムに設定 (500～2000ブロック)
+        double borderSize = 500 + random.nextDouble() * 1500; // 500 to 2000
+        
+        // ワールドボーダーの中心をスポーン地点に設定
+        world.getWorldBorder().setCenter(center.getX(), center.getZ());
+        world.getWorldBorder().setSize(borderSize);
+        
+        // ワールドボーダーの警告距離とダメージを設定
+        world.getWorldBorder().setWarningDistance(50);
+        world.getWorldBorder().setDamageAmount(1.0);
+        world.getWorldBorder().setDamageBuffer(5.0);
+        
+        getLogger().info("ワールドボーダーを設定: 中心(" + center.getX() + ", " + center.getZ() + "), サイズ: " + borderSize);
     }
 
     @Override
