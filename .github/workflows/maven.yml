@@ -1,0 +1,39 @@
+name: Java CI with Maven
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Build ForGense
+      run: mvn -f ForGense/pom.xml clean package
+
+    - name: Build ForJigoku
+      run: mvn -f ForJigoku/pom.xml clean package
+
+    - name: Build Velocity
+      run: mvn -f Velocity/pom.xml clean package
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: plugins
+        path: |
+          ForGense/target/*.jar
+          ForJigoku/target/*.jar
+          Velocity/target/*.jar
