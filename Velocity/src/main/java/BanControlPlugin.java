@@ -139,7 +139,7 @@ public void onPluginMessage(PluginMessageEvent event) {
             uuid = UUID.fromString(in.readUTF());
             banMap.put(uuid, new BanInfo(System.currentTimeMillis() + configManager.getInt("ban_after_night_logout_minutes", 5) * 60_000, BanInfo.Reason.NIGHT_LOGOUT));
             saveBans();
-            break;
+            brea
 
         case "jigoku_night":
             worldTimes.put("jigoku", 13000L); // 夜の時刻として13000を設定
