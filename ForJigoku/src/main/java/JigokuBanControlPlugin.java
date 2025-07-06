@@ -135,24 +135,21 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
 @EventHandler
 public void onPlayerDeath(PlayerDeathEvent event) {
     Player player = event.getEntity();
-    String deathMessage = event.getDeathMessage();
-    UUID playerUUID = player.getUniqueId();
-
-    ByteArrayDataOutput out = ByteStreams.newDataOutput();
-    out.writeUTF("death");
-    out.writeUTF(playerUUID.toString()); // ← BAN処理用
-    out.writeUTF(deathMessage);          // ← デスログ転送用に追加
-
-    player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-
-    // 死亡したプレイヤーを記録
-    deadPlayers.add(playerUUID);
+    UUID uuid = player.getUniqueId();
+    deadPlayers.add(uuid);
     saveData();
 
-    // 1秒後にgenseサーバーへ転送
-    Bukkit.getScheduler().runTaskLater(this, () -> {
-        connectToServer(player, "gense");
-    }, 20L);
+    // Velocityに死亡情報を送信
+    ByteArrayDataOutput out = ByteStreams.newDataOutput();
+    out.writeUTF("death");
+    out.writeUTF(uuid.toString());
+    // 死亡メッセージも送信
+    String deathMessage = event.getDeathMessage();
+    out.writeUTF(deathMessage != null ? deathMessage : player.getName() + " died.");
+    player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+
+    // 死亡したらgenseサーバーに移動する処理はVelocity側で行うため、ここでは削除
+    // connectToServer(player, "gense");
 }
 
     @EventHandler

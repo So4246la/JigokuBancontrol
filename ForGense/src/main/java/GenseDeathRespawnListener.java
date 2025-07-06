@@ -8,6 +8,10 @@ import org.bukkit.event.player.PlayerGameModeChangeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.GameMode;
 
 import com.google.common.io.ByteArrayDataInput;
 import com.google.common.io.ByteArrayDataOutput;
@@ -15,7 +19,7 @@ import com.google.common.io.ByteStreams;
 
 import java.util.UUID;
 
-public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessageListener, Listener {
+public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessageListener, Listener, CommandExecutor {
 
     private static final String CHANNEL = "myserver:bancontrol";
 
@@ -24,6 +28,7 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
         Bukkit.getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
         Bukkit.getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
         getServer().getPluginManager().registerEvents(this, this);
+        this.getCommand("jigoku").setExecutor(this); // コマンドを登録
         getLogger().info("GenseDeathRespawnListenerが有効になりました。");
     }
 
@@ -45,8 +50,8 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
                 uuid = UUID.fromString(in.readUTF());
                 Player targetPlayer = Bukkit.getPlayer(uuid);
                 if (targetPlayer != null) {
-                    // プレイヤーを強制的に死亡させ、PlayerDeathEventをトリガーする
-                    forceKillPlayer(targetPlayer);
+                    // プレイヤーを強制的に死亡させ、即座にリスポーンさせる
+                    triggerPseudoRespawn(targetPlayer);
                 }
                 break;
 
@@ -61,19 +66,46 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
             case "query_gamemode":
                 uuid = UUID.fromString(in.readUTF());
                 Player queriedPlayer = Bukkit.getPlayer(uuid);
+                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                out.writeUTF("gamemode_response");
+                out.writeUTF(uuid.toString());
+
                 if (queriedPlayer != null) {
-                    ByteArrayDataOutput out = ByteStreams.newDataOutput();
-                    out.writeUTF("gamemode_response");
-                    out.writeUTF(uuid.toString());
-                    out.writeUTF(queriedPlayer.getGameMode().name()); // 現在のゲームモードをそのまま返す
-                    
-                    // メッセージはVelocityから来たので、任意のプレイヤー経由で返信
-                    if (!Bukkit.getOnlinePlayers().isEmpty()) {
-                       Bukkit.getOnlinePlayers().iterator().next().sendPluginMessage(this, CHANNEL, out.toByteArray());
-                    }
+                    // プレイヤーがGenseサーバーにいれば、そのゲームモードを返す
+                    out.writeUTF(queriedPlayer.getGameMode().name());
+                } else {
+                    // プレイヤーがGenseサーバーにいなければ、「不明」を意味する情報を返す
+                    out.writeUTF("UNKNOWN");
                 }
+                // メッセージを送信してきたプロキシ経由で返信する
+                // Genseに誰もいなくても、このチャンネルのリスナーはProxyなのでメッセージは届く
+                getServer().sendPluginMessage(this, CHANNEL, out.toByteArray());
                 break;
         }
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!(sender instanceof Player)) {
+            sender.sendMessage("このコマンドはプレイヤーのみ実行できます。");
+            return true;
+        }
+
+        Player player = (Player) sender;
+
+        // スペクテイターモードのプレイヤーはコマンドを実行できない
+        if (player.getGameMode() == GameMode.SPECTATOR) {
+            player.sendMessage("§cスペクテイターモードでは地獄に移動できません。");
+            return true;
+        }
+
+        // Velocityにサーバー移動を依頼する
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("jigoku_transfer");
+        out.writeUTF(player.getUniqueId().toString());
+        player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+
+        return true;
     }
 
     @EventHandler
@@ -96,11 +128,22 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
         player.sendPluginMessage(this, CHANNEL, out.toByteArray());
     }
 
-    // プレイヤーを強制的に死亡させるメソッド
-    private void forceKillPlayer(Player player) {
+    // プレイヤーを強制的に死亡させ、即座にリスポーンさせるメソッド
+    private void triggerPseudoRespawn(Player player) {
         Bukkit.getScheduler().runTask(this, () -> {
             player.sendMessage("§c地獄での死の代償を支払う...");
+            // PlayerDeathEventを発生させる
             player.setHealth(0.0);
+
+            // 少し遅延させてからリスポーンを実行し、イベントが適切に処理されるようにする
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                // このAPIはSpigot(またはそのフォーク)でのみ利用可能です
+                try {
+                    player.spigot().respawn();
+                } catch (Exception e) {
+                    getLogger().warning("player.spigot().respawn()が利用できません。サーバーがSpigot/Paper/Purpurなどであることを確認してください。");
+                }
+            }, 1L); // 1tick後
         });
     }
 }

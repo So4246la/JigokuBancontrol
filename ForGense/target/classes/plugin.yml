@@ -6,4 +6,7 @@ author: So4246la
 description: 現世サーバーで地獄から死亡後リスポーンした際に擬似リスポーンイベントを発火する
 depend: []
 softdepend: []
-commands: {}
+commands:
+  jigoku:
+    description: 地獄サーバーへ移動します。
+    usage: /jigoku
