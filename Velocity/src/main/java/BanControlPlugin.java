@@ -122,10 +122,18 @@ public void onPluginMessage(PluginMessageEvent event) {
             uuid = UUID.fromString(in.readUTF());
             banMap.put(uuid, new BanInfo(System.currentTimeMillis() + configManager.getInt("ban_after_death_minutes", 5) * 60_000, BanInfo.Reason.DEATH));
             saveBans();
-            deathFlagSet.add(uuid); // Gense接続時に死亡処理を行うためフラグを立てる
+            deathFlagSet.add(uuid);
+
             // Genseに死亡情報を転送
             server.getServer("gense").ifPresent(gense ->
                 gense.sendPluginMessage(event.getIdentifier(), event.getData())
+            );
+
+            // 即座にGenseサーバーへ転送
+            server.getPlayer(uuid).ifPresent(player ->
+                server.getServer("gense").ifPresent(target ->
+                    player.createConnectionRequest(target).fireAndForget()
+                )
             );
             break;
 
