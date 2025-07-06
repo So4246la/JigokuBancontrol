@@ -132,12 +132,12 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
     private void triggerPseudoRespawn(Player player) {
         Bukkit.getScheduler().runTask(this, () -> {
             player.sendMessage("§c地獄での死の代償を支払う...");
-            // PlayerDeathEventを発生させる
+
+            // 実際の死亡処理を再度有効化
             player.setHealth(0.0);
 
             // 少し遅延させてからリスポーンを実行し、イベントが適切に処理されるようにする
             Bukkit.getScheduler().runTaskLater(this, () -> {
-                // このAPIはSpigot(またはそのフォーク)でのみ利用可能です
                 try {
                     player.spigot().respawn();
                 } catch (Exception e) {

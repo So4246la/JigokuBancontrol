@@ -96,7 +96,6 @@ public void onPluginMessage(PluginMessageEvent event) {
         case "jigoku_transfer":
             uuid = UUID.fromString(in.readUTF());
             server.getPlayer(uuid).ifPresent(player -> {
-                // 1. 夜間チェック
                 long jigokuTime = worldTimes.getOrDefault("jigoku", -1L);
                 boolean isNight = jigokuTime >= 12000 && jigokuTime < 24000;
 
@@ -105,7 +104,6 @@ public void onPluginMessage(PluginMessageEvent event) {
                     return;
                 }
 
-                // 2. 全てのチェックをパスしたらサーバー移動
                 server.getServer(configManager.getString("jigoku_server_name", "jigoku")).ifPresent(target -> {
                     player.createConnectionRequest(target).fireAndForget();
                 });
@@ -129,7 +127,7 @@ public void onPluginMessage(PluginMessageEvent event) {
                 gense.sendPluginMessage(event.getIdentifier(), event.getData())
             );
 
-            // 即座にGenseサーバーへ転送
+            // 即座にGenseサーバーへ転送する処理を再度有効化
             server.getPlayer(uuid).ifPresent(player ->
                 server.getServer("gense").ifPresent(target ->
                     player.createConnectionRequest(target).fireAndForget()
@@ -144,10 +142,12 @@ public void onPluginMessage(PluginMessageEvent event) {
             break;
 
         case "jigoku_night":
+            worldTimes.put("jigoku", 13000L); // 夜の時刻として13000を設定
             broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
             break;
 
         case "jigoku_day":
+            worldTimes.put("jigoku", 1000L); // 昼の時刻として1000を設定
             broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
             break;
 
@@ -205,18 +205,26 @@ public void onServerPreConnect(ServerPreConnectEvent event) {
     // BAN状態の確認
     if (banMap.containsKey(playerUuid)) {
         BanInfo info = banMap.get(playerUuid);
+        long remainingSeconds = Math.max(0, (info.unbanTime - System.currentTimeMillis()) / 1000);
+        String jigokuServerName = configManager.getString("jigoku_server_name", "jigoku");
+        String genseServerName = configManager.getString("gense_server_name", "gense");
+
+        // 理由を問わず、BANされているプレイヤーはJigokuサーバーへ移動できない
+        if (serverName.equals(jigokuServerName)) {
+            event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            player.disconnect(Component.text(String.format("§cあなたは地獄から追放されています。残り%d秒", remainingSeconds)));
+            return;
+        }
+
+        // 死亡BANの場合
         if (info.reason == BanInfo.Reason.DEATH) {
-            // 死亡BANの場合、genseとjigokuへの接続は許可
-            if ("gense".equals(serverName) || "jigoku".equals(serverName)) {
-                return; // 接続を許可
-            } else {
-                // それ以外のサーバーへの接続は拒否
+            // Genseサーバー以外への接続は許可しない
+            if (!serverName.equals(genseServerName)) {
                 event.setResult(ServerPreConnectEvent.ServerResult.denied());
-                player.disconnect(Component.text("あなたは現在、死亡ペナルティにより他のサーバーへ移動できません。"));
+                player.disconnect(Component.text("§c死亡ペナルティ中です。他のサーバーには移動できません。現世で罪を償ってください。"));
                 return;
             }
-        } else {
-            // 死亡以外の理由でのBANは、問答無用で弾く
+        } else { // 死亡以外の理由でのBAN
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
             player.disconnect(Component.text("あなたはBANされています。理由: " + info.reason.toString()));
             return;
