@@ -1,7 +1,0 @@
-# Genseサーバーの残機システムの基本設定
-
-# プレイヤーが最初に持つ残機の数
-starting-lives: 3
-
-# 残機が1回復するまでの時間（分単位）
-revival-time-minutes: 60
