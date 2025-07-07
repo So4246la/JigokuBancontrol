@@ -1,4 +1,13 @@
 name: JigokuBanControl
 main: jp.example.jigokubancontrol.JigokuBanControlPlugin
 version: 1.0
-api-version: 1.20
+api-version: 1.13
+commands:
+  gense:
+    description: 現世サーバーに移動します
+    usage: /<command>
+    permission: jigokubancontrol.gense
+permissions:
+  jigokubancontrol.gense:
+    description: 現世サーバーへの移動を許可します
+    default: true

@@ -1,0 +1,38 @@
+plugins {
+    id 'java'
+}
+
+group 'jp.example'
+version '1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // ...existing code...
+    implementation 'mysql:mysql-connector-java:8.0.33'
+    // ...existing code...
+}
+
+java {
+    // Java 11以降を指定
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+tasks.withType(JavaCompile) {
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    // マニフェストにMain-Classを指定
+    manifest {
+        attributes(
+            'Main-Class': 'jp.example.bancontrol.BanControlPlugin'
+        )
+    }
+
+    // 不要なファイルを除外
+    exclude 'META-INF/*.DSA', 'META-INF/*.RSA', 'META-INF/*.SF'
+}

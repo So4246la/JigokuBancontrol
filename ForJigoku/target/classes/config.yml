@@ -1,1 +1,10 @@
 spawn-range: 1000
+
+# MySQL設定
+mysql:
+  enabled: true
+  host: localhost
+  port: 3306
+  database: jigoku_bancontrol
+  username: root
+  password: password

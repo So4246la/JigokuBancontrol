@@ -10,19 +10,28 @@
     <packaging>pom</packaging>
 
     <name>JigokuBanControl Parent</name>
+    <description>Parent POM for JigokuBanControl multi-module project</description>
 
     <properties>
-        <java.version>17</java.version>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <velocity.api.version>3.3.0-SNAPSHOT</velocity.api.version>
         <paper.api.version>1.20.4-R0.1-SNAPSHOT</paper.api.version>
     </properties>
 
     <modules>
-        <module>ForGense</module>
-        <module>ForJigoku</module>
         <module>Velocity</module>
+        <module>ForJigoku</module>
+        <module>ForGense</module>
     </modules>
+
+    <repositories>
+        <repository>
+            <id>papermc</id>
+            <url>https://repo.papermc.io/repository/maven-public/</url>
+        </repository>
+    </repositories>
 
     <dependencyManagement>
         <dependencies>
@@ -38,6 +47,17 @@
                 <version>${paper.api.version}</version>
                 <scope>provided</scope>
             </dependency>
+            <dependency>
+                <groupId>com.moandjiezana.toml</groupId>
+                <artifactId>toml4j</artifactId>
+                <version>0.7.2</version>
+            </dependency>
+            <!-- MySQL Connector -->
+            <dependency>
+                <groupId>mysql</groupId>
+                <artifactId>mysql-connector-java</artifactId>
+                <version>8.0.33</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -49,22 +69,12 @@
                     <artifactId>maven-compiler-plugin</artifactId>
                     <version>3.11.0</version>
                     <configuration>
-                        <source>${java.version}</source>
-                        <target>${java.version}</target>
+                        <source>${maven.compiler.source}</source>
+                        <target>${maven.compiler.target}</target>
                     </configuration>
                 </plugin>
             </plugins>
         </pluginManagement>
     </build>
-
-    <repositories>
-        <repository>
-            <id>papermc-repo</id>
-            <url>https://repo.papermc.io/repository/maven-public/</url>
-        </repository>
-        <repository>
-            <id>sonatype</id>
-            <url>https://oss.sonatype.org/content/groups/public/</url>
-        </repository>
-    </repositories>
 </project>
+

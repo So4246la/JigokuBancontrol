@@ -27,6 +27,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.*;
 import java.util.*;
 import java.util.concurrent.*;
 
@@ -47,6 +48,9 @@ public class BanControlPlugin {
     private final Map<String, Long> worldTimes = new ConcurrentHashMap<>();
     private final Map<UUID, CompletableFuture<String>> pendingGameModeQueries = new ConcurrentHashMap<>();
     private final Map<UUID, CompletableFuture<Long>> pendingTimeQueries = new ConcurrentHashMap<>();
+    private ScheduledFuture<?> heartbeatTask; // 追加
+    private Connection mysqlConnection;
+    private boolean mysqlEnabled = false;
 
     @Inject
     public BanControlPlugin(ProxyServer server, @DataDirectory Path dataDirectory, Logger logger) {
@@ -59,6 +63,9 @@ public class BanControlPlugin {
     public void onProxyInitialization(ProxyInitializeEvent event) {
         // ConfigManagerを初期化
         this.configManager = new ConfigManager(dataDirectory, logger);
+
+        // MySQL接続を初期化
+        initializeMySQL();
 
         // データフォルダとファイルの設定
         try {
@@ -79,10 +86,137 @@ public class BanControlPlugin {
         // server.getCommandManager().register(server.getCommandManager().metaBuilder("jigoku").build(), new JigokuCommand()); // Gense側で処理するため削除
         server.getCommandManager().register(server.getCommandManager().metaBuilder("gense").build(), new GenseCommand());
         server.getChannelRegistrar().register(CHANNEL);
+
+        // 定期的にJigokuサーバーの時刻を確認するタスクを開始
+        if (mysqlEnabled) {
+            startMySQLHeartbeatTask();
+        } else {
+            startHeartbeatTask();
+        }
     }
 
-@Subscribe
-public void onPluginMessage(PluginMessageEvent event) {
+    private void initializeMySQL() {
+        // MySQLドライバーを明示的に読み込む
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+        } catch (ClassNotFoundException e) {
+            logger.error("MySQLドライバーが見つかりません。", e);
+            return;
+        }
+
+        com.moandjiezana.toml.Toml mysqlConfig = configManager.getTable("mysql");
+        if (mysqlConfig != null && mysqlConfig.getBoolean("enabled", false)) {
+            String host = mysqlConfig.getString("host", "localhost");
+            int port = mysqlConfig.getLong("port", 3306L).intValue();
+            String database = mysqlConfig.getString("database", "jigoku_bancontrol");
+            String username = mysqlConfig.getString("username", "root");
+            String password = mysqlConfig.getString("password", "password");
+
+            try {
+                String url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC", host, port, database);
+                mysqlConnection = DriverManager.getConnection(url, username, password);
+                mysqlEnabled = true;
+
+                // テーブルを作成
+                createWorldTimeTable();
+                logger.info("MySQL接続に成功しました。");
+            } catch (SQLException e) {
+                logger.error("MySQL接続に失敗しました。", e);
+                mysqlEnabled = false;
+            }
+        }
+    }
+
+    private void createWorldTimeTable() {
+        try (Statement stmt = mysqlConnection.createStatement()) {
+            stmt.execute(
+                "CREATE TABLE IF NOT EXISTS world_times (" +
+                "world_name VARCHAR(64) PRIMARY KEY," +
+                "time BIGINT NOT NULL," +
+                "is_night BOOLEAN NOT NULL," +
+                "last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" +
+                ")"
+            );
+        } catch (SQLException e) {
+            logger.error("world_timesテーブルの作成に失敗しました。", e);
+        }
+    }
+
+    private void startMySQLHeartbeatTask() {
+        heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
+            try {
+                // MySQLから時刻情報を取得
+                String query = "SELECT world_name, time, is_night FROM world_times WHERE world_name = 'jigoku'";
+                try (PreparedStatement stmt = mysqlConnection.prepareStatement(query);
+                     ResultSet rs = stmt.executeQuery()) {
+                    
+                    if (rs.next()) {
+                        long time = rs.getLong("time");
+                        boolean isNight = rs.getBoolean("is_night");
+                        
+                        Long lastTime = worldTimes.get("jigoku");
+                        worldTimes.put("jigoku", time);
+                        
+                        // 昼夜の変化を検出
+                        if (lastTime != null) {
+                            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
+                            if (isNight && !wasNight) {
+                                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+                            } else if (!isNight && wasNight) {
+                                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+                            }
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                logger.error("MySQLから時刻情報の取得に失敗しました。", e);
+            }
+        }, 5, 5, TimeUnit.SECONDS); // 5秒ごとに実行
+    }
+
+    private void startHeartbeatTask() {
+        heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
+            // Jigokuサーバーに接続しているプレイヤーを探す
+            server.getServer(configManager.getString("jigoku_server_name", "jigoku")).ifPresent(jigokuServer -> {
+                Optional<Player> jigokuPlayer = server.getAllPlayers().stream()
+                    .filter(p -> p.getCurrentServer()
+                        .map(s -> s.getServerInfo().getName().equals(configManager.getString("jigoku_server_name", "jigoku")))
+                        .orElse(false))
+                    .findFirst();
+                
+                if (jigokuPlayer.isPresent()) {
+                    // Jigokuにプレイヤーがいる場合、ハートビートを送信
+                    ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                    out.writeUTF("heartbeat");
+                    jigokuServer.sendPluginMessage(CHANNEL, out.toByteArray());
+                } else {
+                    // Jigokuにプレイヤーがいない場合、最後に記録された時刻を使用
+                    // 時刻を推定（20分ごとに1日進む）
+                    Long lastTime = worldTimes.get("jigoku");
+                    if (lastTime != null) {
+                        // 最後の更新から経過した時間を計算し、ゲーム内時間を推定
+                        long elapsedRealSeconds = 30; // 30秒ごとの更新と仮定
+                        long elapsedGameTicks = (elapsedRealSeconds * 20); // 1秒 = 20 ticks
+                        long estimatedTime = (lastTime + elapsedGameTicks) % 24000;
+                        worldTimes.put("jigoku", estimatedTime);
+                        
+                        // 昼夜の判定
+                        boolean wasNight = lastTime >= 12000 && lastTime < 24000;
+                        boolean isNight = estimatedTime >= 12000 && estimatedTime < 24000;
+                        
+                        if (isNight && !wasNight) {
+                            broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+                        } else if (!isNight && wasNight) {
+                            broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+                        }
+                    }
+                }
+            });
+        }, 30, 30, TimeUnit.SECONDS); // 30秒ごとに実行
+    }
+
+    @Subscribe
+    public void onPluginMessage(PluginMessageEvent event) {
     if (!event.getIdentifier().equals(CHANNEL)) {
         return;
     }
@@ -139,7 +273,7 @@ public void onPluginMessage(PluginMessageEvent event) {
             uuid = UUID.fromString(in.readUTF());
             banMap.put(uuid, new BanInfo(System.currentTimeMillis() + configManager.getInt("ban_after_night_logout_minutes", 5) * 60_000, BanInfo.Reason.NIGHT_LOGOUT));
             saveBans();
-            brea
+            break;
 
         case "jigoku_night":
             worldTimes.put("jigoku", 13000L); // 夜の時刻として13000を設定
@@ -164,14 +298,55 @@ public void onPluginMessage(PluginMessageEvent event) {
 
         case "time_response":
             uuid = UUID.fromString(in.readUTF());
-            long time = in.readLong();
-            worldTimes.put("jigoku", time);
+            long responseTime = in.readLong(); // 変数名を変更
+            worldTimes.put("jigoku", responseTime);
             // pendingTimeQueriesの処理
             if (pendingTimeQueries.containsKey(uuid)) {
-                pendingTimeQueries.get(uuid).complete(time);
+                pendingTimeQueries.get(uuid).complete(responseTime);
+            }
+            break;
+
+        case "heartbeat_response":
+            String state = in.readUTF();
+            long heartbeatTime = in.readLong(); // 変数名を変更
+            worldTimes.put("jigoku", heartbeatTime);
+            
+            // 状態に応じてメッセージを送信
+            if (state.equals("jigoku_night")) {
+                worldTimes.put("jigoku", Math.max(12000L, heartbeatTime)); // 夜の時刻を保証
+            } else {
+                worldTimes.put("jigoku", Math.min(11999L, heartbeatTime)); // 昼の時刻を保証
+            }
+            break;
+
+        case "jigoku_time_response":
+            uuid = UUID.fromString(in.readUTF());
+            String worldName = in.readUTF();
+            long jigokuResponseTime = in.readLong(); // 変数名を変更
+            worldTimes.put("jigoku", jigokuResponseTime);
+            // pendingTimeQueriesの処理
+            if (pendingTimeQueries.containsKey(uuid)) {
+                pendingTimeQueries.get(uuid).complete(jigokuResponseTime);
             }
             break;
         
+        case "gense_transfer":
+            uuid = UUID.fromString(in.readUTF());
+            server.getPlayer(uuid).ifPresent(player -> {
+                // BANチェック
+                if (banMap.containsKey(uuid)) {
+                    BanInfo info = banMap.get(uuid);
+                    long remainingSeconds = Math.max(0, (info.unbanTime - System.currentTimeMillis()) / 1000);
+                    player.sendMessage(Component.text(String.format("§cあなたは地獄から追放されています。残り%d秒", remainingSeconds)));
+                    return;
+                }
+
+                server.getServer(configManager.getString("gense_server_name", "gense")).ifPresent(target -> {
+                    player.createConnectionRequest(target).fireAndForget();
+                });
+            });
+            break;
+
         // 他のcaseは省略
     }
 }
@@ -228,6 +403,24 @@ public void onServerPreConnect(ServerPreConnectEvent event) {
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
             player.disconnect(Component.text("あなたはBANされています。理由: " + info.reason.toString()));
             return;
+        }
+    }
+
+    // Jigokuサーバーへの接続時、MySQLから時刻を取得して夜間チェック
+    if (serverName.equals(configManager.getString("jigoku_server_name", "jigoku")) && mysqlEnabled) {
+        try {
+            String query = "SELECT is_night FROM world_times WHERE world_name = 'jigoku'";
+            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query);
+                 ResultSet rs = stmt.executeQuery()) {
+                
+                if (rs.next() && rs.getBoolean("is_night")) {
+                    event.setResult(ServerPreConnectEvent.ServerResult.denied());
+                    player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
+                    return;
+                }
+            }
+        } catch (SQLException e) {
+            logger.error("MySQLから時刻情報の取得に失敗しました。", e);
         }
     }
 }

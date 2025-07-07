@@ -55,4 +55,12 @@ public class ConfigManager {
     public int getInt(String key, int defaultValue) {
         return toml.getLong(key, (long) defaultValue).intValue();
     }
+
+    public boolean getBoolean(String key, boolean defaultValue) {
+        return toml.getBoolean(key, defaultValue);
+    }
+
+    public Toml getTable(String key) {
+        return toml.getTable(key);
+    }
 }

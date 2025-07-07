@@ -15,3 +15,12 @@ move_denied_gense = "現世サーバーには今は移動できません。"
 # 昼夜切替アナウンス
 jigoku_night_message = "どこかから地鳴りが響いてくる…（地獄ワールドが夜になりました）"
 jigoku_day_message = "地鳴りは止んだ様だ...(地獄ワールドの夜が明けました)"
+
+# MySQL設定
+[mysql]
+enabled = true
+host = "localhost"
+port = 3306
+database = "jigoku_bancontrol"
+username = "root"
+password = "password"
