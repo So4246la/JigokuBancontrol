@@ -1,4 +1,5 @@
-spawn-range: 1000
+spawn-range-min: 5000  # 最小距離（原点から離れた場所にスポーン）
+spawn-range-max: 20000 # 最大距離
 
 # MySQL設定
 mysql:

@@ -68,6 +68,24 @@ public class BanControlPlugin {
         initializeMySQL();
 
         // データフォルダとファイルの設定
+        initializeDataFiles();
+
+        loadBans();
+        startCleanupTask();
+
+        // コマンド、イベント、チャンネルを登録
+        registerCommands();
+        server.getChannelRegistrar().register(CHANNEL);
+
+        // 定期的にJigokuサーバーの時刻を確認するタスクを開始
+        if (mysqlEnabled) {
+            startMySQLHeartbeatTask();
+        } else {
+            startHeartbeatTask();
+        }
+    }
+
+    private void initializeDataFiles() {
         try {
             Files.createDirectories(dataDirectory);
             this.banFile = dataDirectory.resolve("bans.json").toFile();
@@ -77,22 +95,17 @@ public class BanControlPlugin {
         } catch (IOException e) {
             logger.error("Failed to create the ban file.", e);
         }
+    }
 
-        loadBans();
-        startCleanupTask();
-
-        // コマンド、イベント、チャンネルを登録
-        server.getCommandManager().register(server.getCommandManager().metaBuilder("unban").build(), new UnbanCommand());
-        // server.getCommandManager().register(server.getCommandManager().metaBuilder("jigoku").build(), new JigokuCommand()); // Gense側で処理するため削除
-        server.getCommandManager().register(server.getCommandManager().metaBuilder("gense").build(), new GenseCommand());
-        server.getChannelRegistrar().register(CHANNEL);
-
-        // 定期的にJigokuサーバーの時刻を確認するタスクを開始
-        if (mysqlEnabled) {
-            startMySQLHeartbeatTask();
-        } else {
-            startHeartbeatTask();
-        }
+    private void registerCommands() {
+        server.getCommandManager().register(
+            server.getCommandManager().metaBuilder("unban").build(), 
+            new UnbanCommand()
+        );
+        server.getCommandManager().register(
+            server.getCommandManager().metaBuilder("gense").build(), 
+            new GenseCommand()
+        );
     }
 
     private void initializeMySQL() {
@@ -217,306 +230,313 @@ public class BanControlPlugin {
 
     @Subscribe
     public void onPluginMessage(PluginMessageEvent event) {
-    if (!event.getIdentifier().equals(CHANNEL)) {
-        return;
-    }
-
-    // プラグインメッセージを常にByteStreamsでラップして処理する
-    ByteArrayDataInput in = ByteStreams.newDataInput(event.getData());
-    String subChannel = in.readUTF();
-    UUID uuid;
-
-    switch (subChannel) {
-        case "jigoku_transfer":
-            uuid = UUID.fromString(in.readUTF());
-            server.getPlayer(uuid).ifPresent(player -> {
-                long jigokuTime = worldTimes.getOrDefault("jigoku", -1L);
-                boolean isNight = jigokuTime >= 12000 && jigokuTime < 24000;
-
-                if (isNight) {
-                    player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
-                    return;
-                }
-
-                server.getServer(configManager.getString("jigoku_server_name", "jigoku")).ifPresent(target -> {
-                    player.createConnectionRequest(target).fireAndForget();
-                });
-            });
-            break;
-
-        case "gamemode_update":
-            uuid = UUID.fromString(in.readUTF());
-            String gameMode = in.readUTF();
-            gameModeCache.put(uuid, gameMode);
-            break;
-
-        case "death":
-            uuid = UUID.fromString(in.readUTF());
-            banMap.put(uuid, new BanInfo(System.currentTimeMillis() + configManager.getInt("ban_after_death_minutes", 5) * 60_000, BanInfo.Reason.DEATH));
-            saveBans();
-            deathFlagSet.add(uuid);
-
-            // Genseに死亡情報を転送
-            server.getServer("gense").ifPresent(gense ->
-                gense.sendPluginMessage(event.getIdentifier(), event.getData())
-            );
-
-            // 即座にGenseサーバーへ転送する処理を再度有効化
-            server.getPlayer(uuid).ifPresent(player ->
-                server.getServer("gense").ifPresent(target ->
-                    player.createConnectionRequest(target).fireAndForget()
-                )
-            );
-            break;
-
-        case "night_logout":
-            uuid = UUID.fromString(in.readUTF());
-            banMap.put(uuid, new BanInfo(System.currentTimeMillis() + configManager.getInt("ban_after_night_logout_minutes", 5) * 60_000, BanInfo.Reason.NIGHT_LOGOUT));
-            saveBans();
-            break;
-
-        case "jigoku_night":
-            worldTimes.put("jigoku", 13000L); // 夜の時刻として13000を設定
-            broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-            break;
-
-        case "jigoku_day":
-            worldTimes.put("jigoku", 1000L); // 昼の時刻として1000を設定
-            broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-            break;
-
-        case "gamemode_response":
-            uuid = UUID.fromString(in.readUTF());
-            String responseGameMode = in.readUTF();
-            // pendingGameModeQueriesの処理は非同期クエリ時に必要
-            if (pendingGameModeQueries.containsKey(uuid)) {
-                pendingGameModeQueries.get(uuid).complete(responseGameMode);
-            }
-            // レスポンスでもキャッシュを更新
-            gameModeCache.put(uuid, responseGameMode);
-            break;
-
-        case "time_response":
-            uuid = UUID.fromString(in.readUTF());
-            long responseTime = in.readLong(); // 変数名を変更
-            worldTimes.put("jigoku", responseTime);
-            // pendingTimeQueriesの処理
-            if (pendingTimeQueries.containsKey(uuid)) {
-                pendingTimeQueries.get(uuid).complete(responseTime);
-            }
-            break;
-
-        case "heartbeat_response":
-            String state = in.readUTF();
-            long heartbeatTime = in.readLong(); // 変数名を変更
-            worldTimes.put("jigoku", heartbeatTime);
-            
-            // 状態に応じてメッセージを送信
-            if (state.equals("jigoku_night")) {
-                worldTimes.put("jigoku", Math.max(12000L, heartbeatTime)); // 夜の時刻を保証
-            } else {
-                worldTimes.put("jigoku", Math.min(11999L, heartbeatTime)); // 昼の時刻を保証
-            }
-            break;
-
-        case "jigoku_time_response":
-            uuid = UUID.fromString(in.readUTF());
-            String worldName = in.readUTF();
-            long jigokuResponseTime = in.readLong(); // 変数名を変更
-            worldTimes.put("jigoku", jigokuResponseTime);
-            // pendingTimeQueriesの処理
-            if (pendingTimeQueries.containsKey(uuid)) {
-                pendingTimeQueries.get(uuid).complete(jigokuResponseTime);
-            }
-            break;
-        
-        case "gense_transfer":
-            uuid = UUID.fromString(in.readUTF());
-            server.getPlayer(uuid).ifPresent(player -> {
-                // BANチェック
-                if (banMap.containsKey(uuid)) {
-                    BanInfo info = banMap.get(uuid);
-                    long remainingSeconds = Math.max(0, (info.unbanTime - System.currentTimeMillis()) / 1000);
-                    player.sendMessage(Component.text(String.format("§cあなたは地獄から追放されています。残り%d秒", remainingSeconds)));
-                    return;
-                }
-
-                server.getServer(configManager.getString("gense_server_name", "gense")).ifPresent(target -> {
-                    player.createConnectionRequest(target).fireAndForget();
-                });
-            });
-            break;
-
-        // 他のcaseは省略
-    }
-}
-
-@Subscribe
-public void onServerPostConnect(ServerPostConnectEvent event) {
-    Player player = event.getPlayer();
-    UUID uuid = player.getUniqueId();
-    String serverName = player.getCurrentServer().map(s -> s.getServerInfo().getName()).orElse("");
-
-    // Genseサーバーに接続し、かつdeathフラグが立っている場合
-    if ("gense".equals(serverName) && deathFlagSet.contains(uuid)) {
-        // Genseに擬似死亡を依頼
-        server.getServer("gense").ifPresent(genseServer -> {
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF("death_respawn");
-            out.writeUTF(uuid.toString());
-            genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
-        });
-        // フラグを解除
-        deathFlagSet.remove(uuid);
-    }
-}
-
-@Subscribe
-public void onServerPreConnect(ServerPreConnectEvent event) {
-    Player player = event.getPlayer();
-    String serverName = event.getOriginalServer().getServerInfo().getName();
-    UUID playerUuid = player.getUniqueId();
-
-    // BAN状態の確認
-    if (banMap.containsKey(playerUuid)) {
-        BanInfo info = banMap.get(playerUuid);
-        long remainingSeconds = Math.max(0, (info.unbanTime - System.currentTimeMillis()) / 1000);
-        String jigokuServerName = configManager.getString("jigoku_server_name", "jigoku");
-        String genseServerName = configManager.getString("gense_server_name", "gense");
-
-        // 理由を問わず、BANされているプレイヤーはJigokuサーバーへ移動できない
-        if (serverName.equals(jigokuServerName)) {
-            event.setResult(ServerPreConnectEvent.ServerResult.denied());
-            player.disconnect(Component.text(String.format("§cあなたは地獄から追放されています。残り%d秒", remainingSeconds)));
+        if (!event.getIdentifier().equals(CHANNEL)) {
             return;
         }
 
-        // 死亡BANの場合
-        if (info.reason == BanInfo.Reason.DEATH) {
-            // Genseサーバー以外への接続は許可しない
-            if (!serverName.equals(genseServerName)) {
-                event.setResult(ServerPreConnectEvent.ServerResult.denied());
-                player.disconnect(Component.text("§c死亡ペナルティ中です。他のサーバーには移動できません。現世で罪を償ってください。"));
+        ByteArrayDataInput in = ByteStreams.newDataInput(event.getData());
+        String subChannel = in.readUTF();
+        
+        try {
+            switch (subChannel) {
+                case "jigoku_transfer":
+                    handleJigokuTransfer(in);
+                    break;
+                case "gense_transfer":
+                    handleGenseTransfer(in);
+                    break;
+                case "gamemode_update":
+                    handleGameModeUpdate(in);
+                    break;
+                case "death_notification": // "death"から変更
+                    handleDeathNotification(in, event);
+                    break;
+                case "night_logout":
+                    handleNightLogout(in);
+                    break;
+                case "jigoku_night":
+                    handleTimeChange(13000L, configManager.getString("jigoku_night_message", 
+                        "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+                    break;
+                case "jigoku_day":
+                    handleTimeChange(1000L, configManager.getString("jigoku_day_message", 
+                        "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+                    break;
+                case "time_state":
+                    handleTimeState(in);
+                    break;
+                case "heartbeat_response":
+                    handleHeartbeatResponse(in);
+                    break;
+            }
+        } catch (Exception e) {
+            logger.error("Error handling plugin message: " + subChannel, e);
+        }
+    }
+
+    private void handleJigokuTransfer(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        server.getPlayer(uuid).ifPresent(player -> {
+            // 時刻チェック
+            if (isJigokuNight()) {
+                player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
                 return;
             }
-        } else { // 死亡以外の理由でのBAN
-            event.setResult(ServerPreConnectEvent.ServerResult.denied());
-            player.disconnect(Component.text("あなたはBANされています。理由: " + info.reason.toString()));
+
+            server.getServer(configManager.getString("jigoku_server_name", "jigoku"))
+                .ifPresent(target -> player.createConnectionRequest(target).fireAndForget());
+        });
+    }
+
+    private void handleGenseTransfer(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        server.getPlayer(uuid).ifPresent(player -> {
+            // 夜間ログアウトのBANチェックのみ
+            BanInfo banInfo = banMap.get(uuid);
+            if (banInfo != null && banInfo.reason == BanInfo.Reason.NIGHT_LOGOUT) {
+                long remainingSeconds = Math.max(0, (banInfo.unbanTime - System.currentTimeMillis()) / 1000);
+                String message = formatBanMessage(banInfo.reason, remainingSeconds);
+                player.sendMessage(Component.text(message));
+                return;
+            }
+
+            // Genseサーバーへ移動（ペナルティなし）
+            server.getServer(configManager.getString("gense_server_name", "gense"))
+                .ifPresent(target -> player.createConnectionRequest(target).fireAndForget());
+        });
+    }
+
+    private void handleGameModeUpdate(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        String gameMode = in.readUTF();
+        gameModeCache.put(uuid, gameMode);
+    }
+
+    private void handleDeathNotification(ByteArrayDataInput in, PluginMessageEvent event) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        String deathMessage = in.readUTF();
+        boolean isDeathTransfer = in.readBoolean(); // 死亡による転送フラグを読み取る
+        
+        // 死亡フラグのみセット（BANは適用しない）
+        deathFlagSet.add(uuid);
+        
+        // 死亡による転送の場合、一時的にフラグを立てる
+        if (isDeathTransfer) {
+            // 夜間退出ペナルティを回避するための一時的なフラグ
+            scheduler.schedule(() -> {
+                // このフラグは自動的に削除されるので、特別な処理は不要
+            }, 10, TimeUnit.SECONDS);
+        }
+
+        // Genseに死亡情報を転送
+        server.getServer("gense").ifPresent(gense ->
+            gense.sendPluginMessage(event.getIdentifier(), event.getData())
+        );
+
+        // 即座にGenseサーバーへ転送（ペナルティなし）
+        server.getPlayer(uuid).ifPresent(player ->
+            server.getServer("gense").ifPresent(target ->
+                player.createConnectionRequest(target).fireAndForget()
+            )
+        );
+    }
+
+    private void handleNightLogout(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        boolean isDeathRelated = in.readBoolean(); // 死亡関連フラグを読み取る
+        
+        // 死亡による転送の場合はペナルティをスキップ
+        if (isDeathRelated) {
+            logger.info("死亡による転送のため夜間ログアウトペナルティをスキップ: " + uuid);
             return;
         }
-    }
-
-    // Jigokuサーバーへの接続時、MySQLから時刻を取得して夜間チェック
-    if (serverName.equals(configManager.getString("jigoku_server_name", "jigoku")) && mysqlEnabled) {
-        try {
-            String query = "SELECT is_night FROM world_times WHERE world_name = 'jigoku'";
-            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query);
-                 ResultSet rs = stmt.executeQuery()) {
-                
-                if (rs.next() && rs.getBoolean("is_night")) {
-                    event.setResult(ServerPreConnectEvent.ServerResult.denied());
-                    player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
-                    return;
-                }
+        
+        // 死亡フラグが立っている場合もスキップ
+        if (deathFlagSet.contains(uuid)) {
+            logger.info("死亡フラグが立っているため夜間ログアウトペナルティをスキップ: " + uuid);
+            return;
+        }
+        
+        long nightLogoutBanDuration = configManager.getInt("ban_after_night_logout_minutes", 10) * 60_000L;
+        
+        // 既存のBANがある場合は上書きしない（より長いペナルティを優先）
+        BanInfo existingBan = banMap.get(uuid);
+        if (existingBan != null) {
+            long existingRemaining = existingBan.unbanTime - System.currentTimeMillis();
+            long newBanTime = System.currentTimeMillis() + nightLogoutBanDuration;
+            if (existingRemaining > nightLogoutBanDuration) {
+                logger.info("既存のBANの方が長いため、夜間ログアウトペナルティを適用しません: " + uuid);
+                return;
             }
-        } catch (SQLException e) {
-            logger.error("MySQLから時刻情報の取得に失敗しました。", e);
+        }
+        
+        // プレイヤー名を取得
+        String playerName = "Unknown";
+        Optional<Player> player = server.getPlayer(uuid);
+        if (player.isPresent()) {
+            playerName = player.get().getUsername();
+        } else {
+            // プレイヤーが既にオフラインの場合、既存のBANデータからユーザーネームを取得
+            if (existingBan != null && existingBan.username != null) {
+                playerName = existingBan.username;
+            }
+            // それでも見つからない場合は、過去のデータを確認
+            logger.info("プレイヤーがオフラインのため、UUIDで識別: " + uuid);
+        }
+        
+        // ユーザーネーム付きでBANを記録
+        banMap.put(uuid, new BanInfo(
+            System.currentTimeMillis() + nightLogoutBanDuration, 
+            BanInfo.Reason.NIGHT_LOGOUT,
+            playerName
+        ));
+        saveBans();
+        
+        logger.info("夜間ログアウトペナルティを適用: " + playerName + " (" + uuid + ")");
+        
+        // 他のサーバーのプレイヤーに通知（保存されたユーザーネームを使用）
+        String message = String.format("§e%s が夜の地獄から逃げ出したため、%d分間のペナルティが課されました。", 
+            playerName, nightLogoutBanDuration / 60_000L);
+        broadcastToAllServers(message);
+    }
+
+    private void broadcastToAllServers(String message) {
+        server.getAllPlayers().forEach(p -> p.sendMessage(Component.text(message)));
+    }
+
+    private void handleTimeChange(long time, String message) {
+        Long lastTime = worldTimes.get("jigoku");
+        worldTimes.put("jigoku", time);
+        
+        if (lastTime != null) {
+            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
+            boolean isNight = time >= 12000 && time < 24000;
+            if (isNight && !wasNight) {
+                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+            } else if (!isNight && wasNight) {
+                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+            }
+        } else {
+             broadcastToGense(message);
         }
     }
-}
 
-private CompletableFuture<String> queryGameMode(Player player) {
-    CompletableFuture<String> future = new CompletableFuture<>();
-    UUID uuid = player.getUniqueId();
-    pendingGameModeQueries.put(uuid, future);
+    private void handleTimeState(ByteArrayDataInput in) {
+        String worldName = in.readUTF();
+        long time = in.readLong();
+        
+        Long lastTime = worldTimes.get(worldName);
+        worldTimes.put(worldName, time);
 
-    server.getServer("gense").ifPresent(genseServer -> {
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        out.writeUTF("query_gamemode");
-        out.writeUTF(uuid.toString());
-        genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
-    });
-
-    // タイムアウト処理
-    scheduler.schedule(() -> {
-        if (!future.isDone()) {
-            future.complete("TIMEOUT"); // タイムアウト時は"TIMEOUT"を返す
-            pendingGameModeQueries.remove(uuid);
+        if (lastTime != null && "jigoku".equals(worldName)) {
+            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
+            boolean isNight = time >= 12000 && time < 24000;
+            if (isNight && !wasNight) {
+                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+            } else if (!isNight && wasNight) {
+                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+            }
         }
-    }, 2, TimeUnit.SECONDS);
+    }
 
-    future.whenComplete((result, error) -> pendingGameModeQueries.remove(uuid));
+    private void handleHeartbeatResponse(ByteArrayDataInput in) {
+        long time = in.readLong();
+        Long lastTime = worldTimes.get("jigoku");
+        worldTimes.put("jigoku", time);
 
-    return future;
-}
-
-private CompletableFuture<Long> queryJigokuTime(Player player) {
-    CompletableFuture<Long> future = new CompletableFuture<>();
-    UUID uuid = player.getUniqueId();
-    // Jigokuの時刻応答はプレイヤーを特定できないため、リクエストごとにFutureを管理する
-    pendingTimeQueries.put(uuid, future);
-
-
-    server.getServer("jigoku").ifPresent(jigokuServer -> {
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        out.writeUTF("get_time");
-        out.writeUTF(player.getUniqueId().toString()); // プレイヤーのUUIDを送信
-        out.writeUTF("world"); // Jigokuのメインワールド名を指定
-        jigokuServer.sendPluginMessage(CHANNEL, out.toByteArray());
-    });
-
-    // タイムアウト処理
-    scheduler.schedule(() -> {
-        if (!future.isDone()) {
-            // タイムアウトした場合は、キャッシュされた最後の時刻情報を使う
-            future.complete(worldTimes.getOrDefault("world", 0L));
-            pendingTimeQueries.remove(uuid);
+        if (lastTime != null) {
+            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
+            boolean isNight = time >= 12000 && time < 24000;
+            if (isNight && !wasNight) {
+                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+            } else if (!isNight && wasNight) {
+                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+            }
         }
-    }, 2, TimeUnit.SECONDS);
-    
-    // 応答が来たら完了させる処理はonPluginMessageにある
-    // ただし、現在の実装ではUUIDが送られてこないので、ブロードキャスト的に全pendingが完了してしまう
-    // これはJigoku側の修正が必要だが、ひとまずこの形で進める
-    future.whenComplete((result, error) -> pendingTimeQueries.remove(uuid));
+    }
 
+    private boolean isJigokuNight() {
+        if (mysqlEnabled) {
+            try {
+                String query = "SELECT is_night FROM world_times WHERE world_name = 'jigoku'";
+                try (PreparedStatement stmt = mysqlConnection.prepareStatement(query);
+                     ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        return rs.getBoolean("is_night");
+                    }
+                }
+            } catch (SQLException e) {
+                logger.error("Failed to check Jigoku night status from MySQL", e);
+            }
+        }
+        
+        // フォールバック: キャッシュから確認
+        Long time = worldTimes.get("jigoku");
+        return time != null && time >= 12000 && time < 24000;
+    }
 
-    return future;
-}
+    @Subscribe
+    public void onServerPostConnect(ServerPostConnectEvent event) {
+        Player player = event.getPlayer();
+        UUID uuid = player.getUniqueId();
+        String serverName = player.getCurrentServer().map(s -> s.getServerInfo().getName()).orElse("");
 
+        // Genseサーバーに接続し、かつdeathフラグが立っている場合
+        if ("gense".equals(serverName) && deathFlagSet.contains(uuid)) {
+            // Genseに擬似死亡を依頼
+            server.getServer("gense").ifPresent(genseServer -> {
+                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                out.writeUTF("death_respawn");
+                out.writeUTF(uuid.toString());
+                genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
+            });
+            // フラグを解除
+            deathFlagSet.remove(uuid);
+        }
+    }
 
-private void cachePlayerGameMode(UUID uuid, String gameMode) {
-    gameModeCache.put(uuid, gameMode);
-    scheduler.schedule(() -> gameModeCache.remove(uuid), 1, TimeUnit.MINUTES);
-}
+    @Subscribe
+    public void onServerPreConnect(ServerPreConnectEvent event) {
+        Player player = event.getPlayer();
+        String serverName = event.getOriginalServer().getServerInfo().getName();
+        UUID playerUuid = player.getUniqueId();
 
-private String getPlayerGameMode(UUID uuid) {
-    return gameModeCache.get(uuid);
-}
-
-private void queryPlayerGameModeFromGense(Player player, ServerPreConnectEvent event) {
-    player.getCurrentServer().ifPresent(server -> {
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        out.writeUTF("query_gamemode");
-        server.sendPluginMessage(CHANNEL, out.toByteArray());
-    });
-
-    // 一時的に接続を保留する (遅延処理が必要)
-    CompletableFuture.runAsync(() -> {
-        try {
-            Thread.sleep(1000); // Genseの応答を待つ（調整可）
-        } catch (InterruptedException ignored) {}
-
-        // レスポンスを受信して処理されているかを確認
-        String gameMode = getPlayerGameMode(player.getUniqueId()); // 一時的保存から取得
-
-        if ("SPECTATOR".equals(gameMode)) {
-            player.sendMessage(Component.text("§c残機がありません。Jigokuには接続できません。"));
+        // 夜間ログアウトのBANチェックのみ
+        BanInfo banInfo = banMap.get(playerUuid);
+        if (banInfo != null && banInfo.reason == BanInfo.Reason.NIGHT_LOGOUT) {
+            long remainingSeconds = Math.max(0, (banInfo.unbanTime - System.currentTimeMillis()) / 1000);
+            
+            // 期限切れのBANは削除
+            if (remainingSeconds <= 0) {
+                banMap.remove(playerUuid);
+                saveBans();
+                return;
+            }
+            
+            // 夜間ログアウトペナルティ中はすべてのサーバーへの接続を制限
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
-        } else {
-            event.setResult(ServerPreConnectEvent.ServerResult.allowed(event.getOriginalServer()));
+            long remainingMinutes = remainingSeconds / 60;
+            String message = String.format("§c夜間ログアウトペナルティ: あと%d分%d秒待つ必要があります。", 
+                remainingMinutes, remainingSeconds % 60);
+            player.sendMessage(Component.text(message));
+            return;
         }
-    });
-}
+
+        // Jigokuサーバーへの接続時の夜間チェック（BANされていない場合のみ）
+        if (serverName.equals(configManager.getString("jigoku_server_name", "jigoku")) && isJigokuNight()) {
+            event.setResult(ServerPreConnectEvent.ServerResult.denied());
+            player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
+        }
+    }
+
+    private String formatBanMessage(BanInfo.Reason reason, long remainingSeconds) {
+        switch (reason) {
+            case NIGHT_LOGOUT:
+                return String.format("§c夜間にログアウトしたペナルティ中です。残り%d秒後にサーバーに接続できます。", remainingSeconds);
+            default:
+                return String.format("§cあなたは制限されています。残り%d秒", remainingSeconds);
+        }
+    }
 
     private void startCleanupTask() {
         scheduler.scheduleAtFixedRate(() -> {
@@ -615,5 +635,4 @@ private void queryPlayerGameModeFromGense(Player player, ServerPreConnectEvent e
             }
         }
     }
-    
 }
