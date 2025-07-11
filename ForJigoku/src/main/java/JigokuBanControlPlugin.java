@@ -41,6 +41,13 @@ import java.sql.*;
 public class JigokuBanControlPlugin extends JavaPlugin implements Listener, PluginMessageListener, CommandExecutor {
 
     private static final String CHANNEL = "myserver:bancontrol";
+    private static final String BUNGEECORD_CHANNEL = "BungeeCord";
+    private static final long DAY_TIME = 24000L;
+    private static final long NIGHT_START = 12000L;
+    private static final long NIGHT_END = 24000L;
+    private static final int TIME_CHECK_INTERVAL = 100; // 5秒 (100 ticks)
+    private static final long PENDING_MESSAGE_EXPIRE_TIME = 86400000L; // 24時間
+    
     private final Set<UUID> deadPlayers = new HashSet<>();
     private final Set<UUID> joinedPlayers = new HashSet<>();
     private final Set<UUID> recentlyDiedPlayers = new HashSet<>(); // 最近死亡したプレイヤーを追跡
@@ -62,45 +69,86 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     public void onEnable() {
         // 設定ファイルをロード
         saveDefaultConfig();
-        FileConfiguration config = getConfig();
-        spawnRangeMin = config.getInt("spawn-range-min", 5000);
-        spawnRangeMax = config.getInt("spawn-range-max", 20000);
+        loadConfiguration();
 
         // MySQL接続を初期化
         initializeMySQL();
 
-        Bukkit.getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
-        Bukkit.getMessenger().registerOutgoingPluginChannel(this, "BungeeCord"); // BungeeCordチャンネルを追加
-        Bukkit.getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
+        // チャンネル登録
+        registerChannels();
+        
+        // イベントとコマンドの登録
         Bukkit.getPluginManager().registerEvents(this, this);
+        this.getCommand("gense").setExecutor(this);
+        this.getCommand("admingense").setExecutor(this);
+        
         getLogger().info("JigokuBanControlが有効になりました。");
+        
+        // データファイルのセットアップ
         setupDataFile();
         loadData();
 
-        // コマンドを登録
-        this.getCommand("gense").setExecutor(this);
+        // 昼夜監視タスクを開始
+        startDayNightMonitor();
+    }
 
-        // 昼夜の切り替わりを監視するタスク
+    private void loadConfiguration() {
+        FileConfiguration config = getConfig();
+        spawnRangeMin = config.getInt("spawn-range-min", 5000);
+        spawnRangeMax = config.getInt("spawn-range-max", 20000);
+        
+        // 設定値の検証
+        if (spawnRangeMin < 0 || spawnRangeMax < spawnRangeMin) {
+            getLogger().warning("不正なスポーン範囲設定を検出しました。デフォルト値を使用します。");
+            spawnRangeMin = 5000;
+            spawnRangeMax = 20000;
+        }
+    }
+
+    private void registerChannels() {
+        Bukkit.getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
+        Bukkit.getMessenger().registerOutgoingPluginChannel(this, BUNGEECORD_CHANNEL);
+        Bukkit.getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
+    }
+
+    private void startDayNightMonitor() {
         getServer().getScheduler().runTaskTimer(this, () -> {
-            World world = getServer().getWorlds().get(0); // メインワールドを想定
+            World world = getMainWorld();
             if (world != null) {
-                boolean isCurrentlyNight = isNight(world);
-                
-                // MySQLに時刻情報を更新
-                if (mysqlEnabled) {
-                    updateWorldTime(world.getName(), world.getTime(), isCurrentlyNight);
-                }
-                
-                if (isCurrentlyNight && !wasNight) {
-                    sendTimeStateToProxy("jigoku_night");
-                    wasNight = true;
-                }
-                if (!isCurrentlyNight && wasNight) {
-                    sendTimeStateToProxy("jigoku_day");
-                    wasNight = false;
-                }
+                checkAndUpdateTimeState(world);
             }
-        }, 0L, 100L); // 5秒ごとにチェック (100 ticks)
+        }, 0L, TIME_CHECK_INTERVAL);
+    }
+
+    private World getMainWorld() {
+        return getServer().getWorlds().isEmpty() ? null : getServer().getWorlds().get(0);
+    }
+
+    private void checkAndUpdateTimeState(World world) {
+        boolean isCurrentlyNight = isNight(world);
+        
+        // MySQLに時刻情報を更新
+        if (mysqlEnabled) {
+            updateWorldTime(world.getName(), world.getTime(), isCurrentlyNight);
+        }
+        
+        // 昼夜の変化を検出
+        if (isCurrentlyNight != wasNight) {
+            String state = isCurrentlyNight ? "jigoku_night" : "jigoku_day";
+            sendTimeStateToProxy(state);
+            wasNight = isCurrentlyNight;
+            
+            // プレイヤーへの通知
+            notifyPlayersOfTimeChange(isCurrentlyNight);
+        }
+    }
+
+    private void notifyPlayersOfTimeChange(boolean isNight) {
+        String message = isNight 
+            ? "§c夜が訪れました。死の危険が増大します..."
+            : "§a朝が訪れました。/gense で現世に戻ることができます。";
+        
+        Bukkit.getOnlinePlayers().forEach(player -> player.sendMessage(message));
     }
 
     private void initializeMySQL() {
@@ -224,77 +272,88 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
 public void onPlayerDeath(PlayerDeathEvent event) {
     Player player = event.getEntity();
     UUID uuid = player.getUniqueId();
-    deadPlayers.add(uuid);
-    recentlyDiedPlayers.add(uuid); // 最近死亡したプレイヤーとして記録
-    saveData();
-
-    // Velocityに死亡情報を送信（BANは適用しない）
-    ByteArrayDataOutput out = ByteStreams.newDataOutput();
-    out.writeUTF("death_notification"); // "death"から変更
-    out.writeUTF(uuid.toString());
-    // 死亡メッセージも送信
-    String deathMessage = event.getDeathMessage();
-    out.writeUTF(deathMessage != null ? deathMessage : player.getName() + " died.");
-    // 死亡による転送であることを示すフラグを追加
-    out.writeBoolean(true);
-    player.sendPluginMessage(this, CHANNEL, out.toByteArray());
     
-    // 10秒後に最近死亡したプレイヤーのリストから削除
-    Bukkit.getScheduler().runTaskLater(this, () -> {
-        recentlyDiedPlayers.remove(uuid);
-    }, 200L); // 10秒 = 200ティック
+    // 死亡データの記録
+    recordPlayerDeath(uuid);
+    
+    // Velocityに死亡情報を送信
+    sendDeathNotification(player, event.getDeathMessage());
 }
+
+    private void recordPlayerDeath(UUID uuid) {
+        deadPlayers.add(uuid);
+        recentlyDiedPlayers.add(uuid);
+        saveData();
+        
+        // 10秒後に最近死亡したプレイヤーのリストから削除
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            recentlyDiedPlayers.remove(uuid);
+        }, 200L);
+    }
+
+    private void sendDeathNotification(Player player, String deathMessage) {
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("death_notification");
+        out.writeUTF(player.getUniqueId().toString());
+        out.writeUTF(deathMessage != null ? deathMessage : player.getName() + " died.");
+        out.writeBoolean(true); // 死亡による転送フラグ
+        
+        sendPluginMessage(out.toByteArray());
+    }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
         UUID playerUuid = player.getUniqueId();
-        String playerName = player.getName(); // プレイヤー名を取得
         
-        // 最近死亡したプレイヤーの場合は夜間ログアウトペナルティをスキップ
+        // 死亡による退出の場合はスキップ
         if (recentlyDiedPlayers.contains(playerUuid)) {
-            getLogger().info("死亡による転送のため夜間ログアウトペナルティをスキップ: " + playerName);
+            getLogger().info("死亡による転送のため夜間ログアウトペナルティをスキップ: " + player.getName());
             recentlyDiedPlayers.remove(playerUuid);
             return;
         }
         
+        // 夜間ログアウトの処理
         if (isNight(player.getWorld())) {
-            // 既に保留リストにある場合はスキップ
-            List<String> pendingNightLogouts = dataConfig.getStringList("pending-night-logouts");
-            if (pendingNightLogouts.contains(playerUuid.toString())) {
-                getLogger().info("既に保留リストに存在: " + playerName);
-                return;
-            }
-            
-            // 夜間ログアウトをVelocityに通知
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF("night_logout");
-            out.writeUTF(playerUuid.toString());
-            // 死亡による転送ではないことを示すフラグを追加
-            out.writeBoolean(false);
-            
-            // 他のオンラインプレイヤーを取得（ログアウトするプレイヤーを除く）
-            Collection<? extends Player> remainingPlayers = getServer().getOnlinePlayers().stream()
-                .filter(p -> !p.getUniqueId().equals(playerUuid))
-                .collect(Collectors.toList());
-            
-            if (!remainingPlayers.isEmpty()) {
-                // 他のプレイヤー経由で送信
-                Player sender = remainingPlayers.iterator().next();
-                sender.sendPluginMessage(this, CHANNEL, out.toByteArray());
-                getLogger().info("夜間ログアウト通知をVelocityに送信しました: " + playerName);
-            } else {
-                // 他にプレイヤーがいない場合は、データファイルに保存
-                pendingNightLogouts.add(playerUuid.toString());
-                dataConfig.set("pending-night-logouts", pendingNightLogouts);
-                
-                // タイムスタンプとプレイヤー名も保存
-                dataConfig.set("pending-night-logout-time." + playerUuid.toString(), System.currentTimeMillis());
-                dataConfig.set("pending-night-logout-name." + playerUuid.toString(), playerName);
-                saveData();
-                getLogger().info("夜間ログアウト通知を保留しました: " + playerName);
-            }
+            handleNightLogout(player);
         }
+    }
+
+    private void handleNightLogout(Player player) {
+        UUID playerUuid = player.getUniqueId();
+        String playerName = player.getName();
+        
+        // 既に保留リストにある場合はスキップ
+        if (isPendingNightLogout(playerUuid)) {
+            getLogger().info("既に保留リストに存在: " + playerName);
+            return;
+        }
+        
+        // 夜間ログアウトを送信または保留
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("night_logout");
+        out.writeUTF(playerUuid.toString());
+        out.writeBoolean(false); // 死亡による転送ではない
+        
+        if (!sendPluginMessage(out.toByteArray())) {
+            // 送信できない場合は保留
+            savePendingNightLogout(playerUuid, playerName);
+        }
+    }
+
+    private boolean isPendingNightLogout(UUID uuid) {
+        List<String> pendingList = dataConfig.getStringList("pending-night-logouts");
+        return pendingList.contains(uuid.toString());
+    }
+
+    private void savePendingNightLogout(UUID uuid, String playerName) {
+        List<String> pendingList = new ArrayList<>(dataConfig.getStringList("pending-night-logouts"));
+        pendingList.add(uuid.toString());
+        dataConfig.set("pending-night-logouts", pendingList);
+        dataConfig.set("pending-night-logout-time." + uuid.toString(), System.currentTimeMillis());
+        dataConfig.set("pending-night-logout-name." + uuid.toString(), playerName);
+        saveData();
+        getLogger().info("夜間ログアウト通知を保留しました: " + playerName);
     }
 
     @EventHandler
@@ -302,107 +361,116 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         Player player = event.getPlayer();
         UUID playerUUID = player.getUniqueId();
 
+        // 保留中のメッセージを処理
+        processPendingMessages(player);
+        
+        // プレイヤーの状態に応じた処理
+        handlePlayerJoinState(player, playerUUID);
+    }
+
+    private void processPendingMessages(Player player) {
         // 保留中の夜間ログアウト通知を送信
-        List<String> pendingNightLogouts = dataConfig.getStringList("pending-night-logouts");
-        if (!pendingNightLogouts.isEmpty()) {
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                List<String> toRemove = new ArrayList<>();
-                long currentTime = System.currentTimeMillis();
-                
-                for (String uuidString : pendingNightLogouts) {
-                    // タイムスタンプをチェック（24時間以上古いものは削除）
-                    Long timestamp = dataConfig.getLong("pending-night-logout-time." + uuidString);
-                    if (timestamp != null && currentTime - timestamp > 86400000L) { // 24時間
-                        toRemove.add(uuidString);
-                        dataConfig.set("pending-night-logout-time." + uuidString, null);
-                        getLogger().info("古い夜間ログアウト通知を削除: " + uuidString);
-                        continue;
-                    }
-                    
-                    ByteArrayDataOutput out = ByteStreams.newDataOutput();
-                    out.writeUTF("night_logout");
-                    out.writeUTF(uuidString);
-                    // 死亡による転送ではないことを示すフラグを追加
-                    out.writeBoolean(false);
-                    player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-                    getLogger().info("保留していた夜間ログアウト通知を送信: " + uuidString);
-                    toRemove.add(uuidString);
-                    dataConfig.set("pending-night-logout-time." + uuidString, null);
-                }
-                
-                // 送信済みの通知を削除
-                pendingNightLogouts.removeAll(toRemove);
-                if (pendingNightLogouts.isEmpty()) {
-                    dataConfig.set("pending-night-logouts", null);
-                } else {
-                    dataConfig.set("pending-night-logouts", pendingNightLogouts);
-                }
-                saveData();
-            }, 20L); // 1秒後に送信
-        }
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            sendPendingNightLogouts(player);
+        }, 20L);
+    }
 
-        // 保留中の時刻状態があれば送信
-        String pendingState = dataConfig.getString("pending-time-state");
-        if (pendingState != null) {
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                sendTimeStateToProxy(pendingState);
-                dataConfig.set("pending-time-state", null);
-                saveData();
-            }, 20L); // 1秒後に送信
-        }
-
-        if (deadPlayers.contains(playerUUID)) {
-            // 死亡からの復帰の場合、ランダムな場所にテレポート
-            teleportToRandomLocation(player, "§cあなたは死から蘇り、見知らぬ場所へ飛ばされた...");
-            deadPlayers.remove(playerUUID);
-            if (!joinedPlayers.contains(playerUUID)) {
-                joinedPlayers.add(playerUUID);
+    private void sendPendingNightLogouts(Player player) {
+        List<String> pendingList = new ArrayList<>(dataConfig.getStringList("pending-night-logouts"));
+        if (pendingList.isEmpty()) return;
+        
+        List<String> toRemove = new ArrayList<>();
+        long currentTime = System.currentTimeMillis();
+        
+        for (String uuidString : pendingList) {
+            Long timestamp = dataConfig.getLong("pending-night-logout-time." + uuidString);
+            
+            // 期限切れのデータを削除
+            if (timestamp != null && currentTime - timestamp > PENDING_MESSAGE_EXPIRE_TIME) {
+                toRemove.add(uuidString);
+                cleanupPendingData(uuidString);
+                continue;
             }
-            saveData();
-        } else if (!joinedPlayers.contains(playerUUID)) {
-            // 初参加の場合、ランダムな場所にテレポート
-            teleportToRandomLocation(player, "§e地獄へようこそ！");
-            joinedPlayers.add(playerUUID);
-            saveData();
             
-            // 初参加者向けの追加情報
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                player.sendMessage("§6========================================");
-                player.sendMessage("§e地獄ワールドでは昼間のみ現世に戻ることができます。");
-                player.sendMessage("§a/gense §7- 昼間に現世へ戻る（夜間は使用不可）");
-                player.sendMessage("§c夜間は危険です！死亡すると遠くへ飛ばされます。");
-                player.sendMessage("§6========================================");
-            }, 40L); // 2秒後に表示
+            // 夜間ログアウト通知を送信
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("night_logout");
+            out.writeUTF(uuidString);
+            out.writeBoolean(false);
+            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+            
+            toRemove.add(uuidString);
+            cleanupPendingData(uuidString);
+        }
+        
+        // 処理済みのデータを削除
+        pendingList.removeAll(toRemove);
+        updatePendingList(pendingList);
+    }
+
+    private void cleanupPendingData(String uuidString) {
+        dataConfig.set("pending-night-logout-time." + uuidString, null);
+        dataConfig.set("pending-night-logout-name." + uuidString, null);
+    }
+
+    private void updatePendingList(List<String> pendingList) {
+        if (pendingList.isEmpty()) {
+            dataConfig.set("pending-night-logouts", null);
         } else {
-            // 通常の参加の場合
-            player.sendMessage("§e再び地獄へようこそ！");
-            
-            // リマインダー
-            Bukkit.getScheduler().runTaskLater(this, () -> {
-                if (isNight(player.getWorld())) {
-                    player.sendMessage("§c現在は夜間です。朝まで生き延びてください！");
-                } else {
-                    player.sendMessage("§a昼間です。/gense で現世に戻ることができます。");
-                }
-            }, 40L); // 2秒後に表示
+            dataConfig.set("pending-night-logouts", pendingList);
+        }
+        saveData();
+    }
+
+    private void handlePlayerJoinState(Player player, UUID playerUUID) {
+        if (deadPlayers.contains(playerUUID)) {
+            handleDeadPlayerJoin(player, playerUUID);
+        } else if (!joinedPlayers.contains(playerUUID)) {
+            handleFirstTimeJoin(player, playerUUID);
+        } else {
+            handleRegularJoin(player);
         }
     }
 
-    @EventHandler
-    public void onPlayerRespawn(PlayerRespawnEvent event) {
-        Player player = event.getPlayer();
-        World world = player.getWorld();
+    private void handleDeadPlayerJoin(Player player, UUID playerUUID) {
+        teleportToRandomLocation(player, "§cあなたは死から蘇り、見知らぬ場所へ飛ばされた...");
+        deadPlayers.remove(playerUUID);
+        joinedPlayers.add(playerUUID);
+        saveData();
+    }
 
-        // 安全なリスポーン地点を取得
-        Location randomLocation = getSafeSpawnLocation(world);
+    private void handleFirstTimeJoin(Player player, UUID playerUUID) {
+        teleportToRandomLocation(player, "§e地獄へようこそ！");
+        joinedPlayers.add(playerUUID);
+        saveData();
+        
+        // 初参加者向けの情報表示
+        showWelcomeMessage(player);
+    }
 
-        // リスポーン地点をランダムな座標に設定
-        event.setRespawnLocation(randomLocation);
+    private void handleRegularJoin(Player player) {
+        player.sendMessage("§e再び地獄へようこそ！");
+        showTimeReminder(player);
+    }
 
-        // テレポート後にメッセージを送信
-        Bukkit.getScheduler().runTask(this, () -> {
-            player.sendMessage("§c死の代償として、新たな場所に飛ばされた...");
-        });
+    private void showWelcomeMessage(Player player) {
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            player.sendMessage("§6========================================");
+            player.sendMessage("§e地獄ワールドでは昼間のみ現世に戻ることができます。");
+            player.sendMessage("§a/gense §7- 昼間に現世へ戻る（夜間は使用不可）");
+            player.sendMessage("§c夜間は危険です！死亡すると遠くへ飛ばされます。");
+            player.sendMessage("§6========================================");
+        }, 40L);
+    }
+
+    private void showTimeReminder(Player player) {
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (isNight(player.getWorld())) {
+                player.sendMessage("§c現在は夜間です。朝まで生き延びてください！");
+            } else {
+                player.sendMessage("§a昼間です。/gense で現世に戻ることができます。");
+            }
+        }, 40L);
     }
 
     private void teleportToRandomLocation(Player player, String welcomeMessage) {
@@ -426,43 +494,41 @@ public void onPlayerDeath(PlayerDeathEvent event) {
 
     private Location getSafeSpawnLocation(World world) {
         if (world == null) {
-            world = Bukkit.getWorlds().get(0); 
+            world = getMainWorld();
         }
         
-        // 広範囲で試行（より分散したスポーン）
-//         for (int i = 0; i < 200; i++) {
-        for (int i = 0; i < 100; i++) { // 試行回数を減少
-            // 最小距離から最大距離の間でランダムな距離を決定
-            int range = spawnRangeMax - spawnRangeMin;
-            int distance = spawnRangeMin + random.nextInt(range);
-            
-            // ランダムな角度で方向を決定
+        // キャッシュを使用した高速化
+        List<Location> cachedLocations = findMultipleSafeLocations(world, 5);
+        if (!cachedLocations.isEmpty()) {
+            return cachedLocations.get(random.nextInt(cachedLocations.size()));
+        }
+        
+        // キャッシュが見つからない場合は強制的に場所を確保
+        return forceFindSafeLocation(world);
+    }
+
+    private List<Location> findMultipleSafeLocations(World world, int count) {
+        List<Location> locations = new ArrayList<>();
+        int maxAttempts = 50; // 試行回数を制限
+        
+        for (int i = 0; i < maxAttempts && locations.size() < count; i++) {
+            int distance = spawnRangeMin + random.nextInt(spawnRangeMax - spawnRangeMin);
             double angle = random.nextDouble() * 2 * Math.PI;
             int x = (int)(distance * Math.cos(angle));
             int z = (int)(distance * Math.sin(angle));
             
-            // ネザーのような環境の場合は特別な処理
-            if (world.getEnvironment() == World.Environment.NETHER) {
-                Location loc = findSafeNetherLocation(world, x, z);
-                if (loc != null) {
-                    getLogger().info(String.format("安全なスポーン地点を発見: x=%d, z=%d (距離: %d)", x, z, distance));
-                    return loc;
-                }
-                continue;
-            }
-            
-            // 通常ワールドの処理
-            Location loc = findSafeNormalLocation(world, x, z);
+            Location loc = world.getEnvironment() == World.Environment.NETHER
+                ? findSafeNetherLocation(world, x, z)
+                : findSafeNormalLocation(world, x, z);
+                
             if (loc != null) {
-                getLogger().info(String.format("安全なスポーン地点を発見: x=%d, z=%d (距離: %d)", x, z, distance));
-                return loc;
+                locations.add(loc);
             }
         }
         
-        // 200回試行してもダメなら、別の戦略を試す
-        return findSafeLocationWithDifferentStrategy(world);
+        return locations;
     }
-    
+
     private Location findSafeNormalLocation(World world, int x, int z) {
         int y = world.getHighestBlockYAt(x, z);
         // 海面より低い場合は、海面まで引き上げる
@@ -500,39 +566,8 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         return null;
     }
 
-    private Location findSafeLocationWithDifferentStrategy(World world) {
-        // グリッド探索：一定間隔で探索
-        int gridSize = 1000; // 1000ブロックごとにチェック
-        
-        for (int radius = spawnRangeMin; radius <= spawnRangeMax; radius += gridSize) {
-            // 円周上を探索
-            int numPoints = (int)(2 * Math.PI * radius / gridSize);
-            numPoints = Math.max(8, numPoints); // 最低8点はチェック
-            
-            for (int i = 0; i < numPoints; i++) {
-                double angle = (2 * Math.PI * i) / numPoints;
-                int x = (int)(radius * Math.cos(angle));
-                int z = (int)(radius * Math.sin(angle));
-                
-                Location loc;
-                if (world.getEnvironment() == World.Environment.NETHER) {
-                    loc = findSafeNetherLocation(world, x, z);
-                } else {
-                    loc = findSafeNormalLocation(world, x, z);
-                }
-                
-                if (loc != null) {
-                    getLogger().info(String.format("グリッド探索で安全なスポーン地点を発見: x=%d, z=%d", x, z));
-                    return loc;
-                }
-            }
-        }
-        
-        // それでも見つからない場合は、最小範囲内で確実に見つける
-        return forceFinSafeLocation(world);
-    }
-    
-    private Location forceFinSafeLocation(World world) {
+    private Location forceFindSafeLocation(World world) {
+        // メソッド名を修正: forceFinSafeLocation -> forceFindSafeLocation
         // 最小範囲の近くで必ず見つける
         for (int attempts = 0; attempts < 1000; attempts++) {
             int distance = spawnRangeMin + random.nextInt(2000); // 最小距離+2000の範囲
@@ -710,6 +745,22 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             player.sendMessage("§a現世への移動を開始します...");
             player.sendMessage("§7(現在の時刻: " + normalizedTime + "/24000 - 昼間)");
             return true;
+        } else if (command.getName().equalsIgnoreCase("admingense")) {
+            // OP権限チェック
+            if (!player.isOp()) {
+                player.sendMessage("§cこのコマンドを実行する権限がありません。");
+                return true;
+            }
+            
+            // 管理者用の現世転送
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("admin_gense_transfer");
+            out.writeUTF(player.getUniqueId().toString());
+            sendPluginMessage(out.toByteArray());
+            
+            player.sendMessage("§a[管理者] 現世への強制転送を開始します...");
+            getLogger().info(String.format("[管理者転送] %s が現世への強制転送を実行しました。", player.getName()));
+            return true;
         }
 
         return false;
@@ -759,15 +810,13 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         sendPluginMessage(out.toByteArray());
     }
 
-    private void sendPluginMessage(byte[] message) {
+    private boolean sendPluginMessage(byte[] message) {
         Collection<? extends Player> players = Bukkit.getOnlinePlayers();
         
         if (!players.isEmpty()) {
             players.iterator().next().sendPluginMessage(this, CHANNEL, message);
-        } else {
-            // プレイヤーがいない場合は保留
-            dataConfig.set("pending-messages", message);
-            saveData();
+            return true;
         }
+        return false;
     }
 }

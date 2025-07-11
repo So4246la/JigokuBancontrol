@@ -7,7 +7,14 @@ commands:
     description: 現世サーバーに移動します
     usage: /<command>
     permission: jigokubancontrol.gense
+  admingense:
+    description: 管理者用 - 制限なく現世サーバーに移動します
+    usage: /<command>
+    permission: jigokubancontrol.admin
 permissions:
   jigokubancontrol.gense:
     description: 現世サーバーへの移動を許可します
     default: true
+  jigokubancontrol.admin:
+    description: 管理者用コマンドの使用を許可します
+    default: op

@@ -10,3 +10,11 @@ commands:
   jigoku:
     description: 地獄サーバーへ移動します。
     usage: /jigoku
+  adminjigoku:
+    description: 管理者用 - 制限なく地獄サーバーへ移動します。
+    usage: /adminjigoku
+    permission: gense.admin
+permissions:
+  gense.admin:
+    description: 管理者用コマンドの使用を許可します
+    default: op

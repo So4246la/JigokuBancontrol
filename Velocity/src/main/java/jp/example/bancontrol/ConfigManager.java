@@ -12,7 +12,7 @@ public class ConfigManager {
 
     private final Path dataDirectory;
     private final Logger logger;
-    private Toml toml;
+    private Toml config;
 
     public ConfigManager(Path dataDirectory, Logger logger) {
         this.dataDirectory = dataDirectory;
@@ -21,46 +21,39 @@ public class ConfigManager {
     }
 
     private void loadConfig() {
-        try {
-            Path configFile = dataDirectory.resolve("config.toml");
-            if (!Files.exists(configFile)) {
-                logger.info("Config file not found, creating a default one...");
-                try (InputStream in = getClass().getClassLoader().getResourceAsStream("config.toml")) {
-                    if (in == null) {
-                        logger.error("Default config.toml not found in JAR resources.");
-                        this.toml = new Toml(); // 空のTomlでフォールバック
-                        return;
-                    }
-                    Files.createDirectories(dataDirectory);
+        Path configFile = dataDirectory.resolve("config.toml");
+        if (!Files.exists(configFile)) {
+            logger.info("config.tomlが見つかりません。デフォルト設定で起動します。");
+            try (InputStream in = getClass().getResourceAsStream("/config.toml")) {
+                if (in != null) {
                     Files.copy(in, configFile);
-                    logger.info("Default config.toml has been copied to {}.", configFile);
+                    logger.info("デフォルトのconfig.tomlを生成しました。");
+                } else {
+                    logger.warn("デフォルトのconfig.tomlリソースが見つかりません。");
                 }
+            } catch (IOException e) {
+                logger.error("デフォルトのconfig.tomlのコピーに失敗しました。", e);
             }
-            this.toml = new Toml().read(configFile.toFile());
-            logger.info("Configuration loaded successfully.");
-        } catch (IOException e) {
-            logger.error("Failed to load or create config.toml. Using default values.", e);
-            this.toml = new Toml(); // エラー時も空のTomlでフォールバック
+        }
+
+        try {
+            config = new Toml().read(configFile.toFile());
+        } catch (Exception e) {
+            logger.error("config.tomlの読み込みに失敗しました。デフォルト値を使用します。", e);
+            config = new Toml(); // 空のTomlオブジェクト
         }
     }
 
     public String getString(String key, String defaultValue) {
-        return toml.getString(key, defaultValue);
-    }
-
-    public long getLong(String key, long defaultValue) {
-        return toml.getLong(key, defaultValue);
+        return config.getString(key, defaultValue);
     }
 
     public int getInt(String key, int defaultValue) {
-        return toml.getLong(key, (long) defaultValue).intValue();
-    }
-
-    public boolean getBoolean(String key, boolean defaultValue) {
-        return toml.getBoolean(key, defaultValue);
+        Long value = config.getLong(key);
+        return value != null ? value.intValue() : defaultValue;
     }
 
     public Toml getTable(String key) {
-        return toml.getTable(key);
+        return config.getTable(key);
     }
 }

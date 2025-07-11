@@ -16,8 +16,10 @@ import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
+import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import jp.example.bancontrol.ConfigManager; // Add this import
+import jp.example.bancontrol.BanInfo; // Add this import
 import net.kyori.adventure.key.Key; // Add this import
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
@@ -35,6 +37,12 @@ import java.util.concurrent.*;
 public class BanControlPlugin {
 
     private static final MinecraftChannelIdentifier CHANNEL = MinecraftChannelIdentifier.create("myserver", "bancontrol");
+    private static final long NIGHT_START = 12000L;
+    private static final long NIGHT_END = 24000L;
+    private static final long DAY_TIME = 24000L;
+    private static final int HEARTBEAT_INTERVAL = 30;
+    private static final int MYSQL_HEARTBEAT_INTERVAL = 5;
+    
     private final ProxyServer server;
     private final Path dataDirectory;
     private final Logger logger;
@@ -42,7 +50,7 @@ public class BanControlPlugin {
     private final Map<UUID, BanInfo> banMap = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final ObjectMapper mapper = new ObjectMapper();
-    private final Set<UUID> deathFlagSet = new HashSet<>(); // Added deathFlagSet here
+    private final Set<UUID> deathFlagSet = Collections.synchronizedSet(new HashSet<>()); // Thread-safe化
     private ConfigManager configManager;
     private final Map<UUID, String> gameModeCache = new ConcurrentHashMap<>();
     private final Map<String, Long> worldTimes = new ConcurrentHashMap<>();
@@ -61,23 +69,34 @@ public class BanControlPlugin {
 
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
-        // ConfigManagerを初期化
-        this.configManager = new ConfigManager(dataDirectory, logger);
+        try {
+            // ConfigManagerを初期化
+            this.configManager = new ConfigManager(dataDirectory, logger);
 
-        // MySQL接続を初期化
-        initializeMySQL();
+            // MySQL接続を初期化
+            initializeMySQL();
 
-        // データフォルダとファイルの設定
-        initializeDataFiles();
+            // データフォルダとファイルの設定
+            initializeDataFiles();
 
-        loadBans();
-        startCleanupTask();
+            loadBans();
+            startCleanupTask();
 
-        // コマンド、イベント、チャンネルを登録
-        registerCommands();
-        server.getChannelRegistrar().register(CHANNEL);
+            // コマンド、イベント、チャンネルを登録
+            registerCommands();
+            server.getChannelRegistrar().register(CHANNEL);
 
-        // 定期的にJigokuサーバーの時刻を確認するタスクを開始
+            // 定期的にJigokuサーバーの時刻を確認するタスクを開始
+            startTimeCheckTask();
+            
+            // シャットダウンフックを登録
+            Runtime.getRuntime().addShutdownHook(new Thread(this::cleanup));
+        } catch (Exception e) {
+            logger.error("プラグイン初期化中にエラーが発生しました。", e);
+        }
+    }
+
+    private void startTimeCheckTask() {
         if (mysqlEnabled) {
             startMySQLHeartbeatTask();
         } else {
@@ -106,6 +125,15 @@ public class BanControlPlugin {
             server.getCommandManager().metaBuilder("gense").build(), 
             new GenseCommand()
         );
+        // 管理者用コマンドを追加
+        server.getCommandManager().register(
+            server.getCommandManager().metaBuilder("admingense").build(), 
+            new AdminGenseCommand()
+        );
+        server.getCommandManager().register(
+            server.getCommandManager().metaBuilder("adminjigoku").build(), 
+            new AdminJigokuCommand()
+        );
     }
 
     private void initializeMySQL() {
@@ -119,24 +147,29 @@ public class BanControlPlugin {
 
         com.moandjiezana.toml.Toml mysqlConfig = configManager.getTable("mysql");
         if (mysqlConfig != null && mysqlConfig.getBoolean("enabled", false)) {
-            String host = mysqlConfig.getString("host", "localhost");
-            int port = mysqlConfig.getLong("port", 3306L).intValue();
-            String database = mysqlConfig.getString("database", "jigoku_bancontrol");
-            String username = mysqlConfig.getString("username", "root");
-            String password = mysqlConfig.getString("password", "password");
+            connectToMySQL(mysqlConfig);
+        }
+    }
 
-            try {
-                String url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC", host, port, database);
-                mysqlConnection = DriverManager.getConnection(url, username, password);
-                mysqlEnabled = true;
+    private void connectToMySQL(com.moandjiezana.toml.Toml config) {
+        String host = config.getString("host", "localhost");
+        int port = config.getLong("port", 3306L).intValue();
+        String database = config.getString("database", "jigoku_bancontrol");
+        String username = config.getString("username", "root");
+        String password = config.getString("password", "password");
 
-                // テーブルを作成
-                createWorldTimeTable();
-                logger.info("MySQL接続に成功しました。");
-            } catch (SQLException e) {
-                logger.error("MySQL接続に失敗しました。", e);
-                mysqlEnabled = false;
-            }
+        try {
+            String url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&autoReconnect=true", 
+                host, port, database);
+            mysqlConnection = DriverManager.getConnection(url, username, password);
+            mysqlEnabled = true;
+
+            // テーブルを作成
+            createWorldTimeTable();
+            logger.info("MySQL接続に成功しました。");
+        } catch (SQLException e) {
+            logger.error("MySQL接続に失敗しました。", e);
+            mysqlEnabled = false;
         }
     }
 
@@ -158,74 +191,108 @@ public class BanControlPlugin {
     private void startMySQLHeartbeatTask() {
         heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
             try {
-                // MySQLから時刻情報を取得
-                String query = "SELECT world_name, time, is_night FROM world_times WHERE world_name = 'jigoku'";
-                try (PreparedStatement stmt = mysqlConnection.prepareStatement(query);
-                     ResultSet rs = stmt.executeQuery()) {
-                    
-                    if (rs.next()) {
-                        long time = rs.getLong("time");
-                        boolean isNight = rs.getBoolean("is_night");
-                        
-                        Long lastTime = worldTimes.get("jigoku");
-                        worldTimes.put("jigoku", time);
-                        
-                        // 昼夜の変化を検出
-                        if (lastTime != null) {
-                            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
-                            if (isNight && !wasNight) {
-                                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-                            } else if (!isNight && wasNight) {
-                                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-                            }
-                        }
-                    }
-                }
-            } catch (SQLException e) {
-                logger.error("MySQLから時刻情報の取得に失敗しました。", e);
+                updateWorldTimeFromMySQL();
+            } catch (Exception e) {
+                logger.error("MySQL更新タスクでエラーが発生しました。", e);
             }
-        }, 5, 5, TimeUnit.SECONDS); // 5秒ごとに実行
+        }, MYSQL_HEARTBEAT_INTERVAL, MYSQL_HEARTBEAT_INTERVAL, TimeUnit.SECONDS);
+    }
+
+    private void updateWorldTimeFromMySQL() {
+        if (!mysqlEnabled || mysqlConnection == null) return;
+        
+        String query = "SELECT world_name, time, is_night FROM world_times WHERE world_name = ?";
+        try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+            stmt.setString(1, "jigoku");
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    long time = rs.getLong("time");
+                    updateWorldTime("jigoku", time);
+                }
+            }
+        } catch (SQLException e) {
+            logger.error("MySQLから時刻情報の取得に失敗しました。", e);
+            checkMySQLConnection();
+        }
+    }
+
+    private void checkMySQLConnection() {
+        try {
+            if (mysqlConnection == null || mysqlConnection.isClosed()) {
+                logger.info("MySQL接続が切断されました。再接続を試みます。");
+                initializeMySQL();
+            }
+        } catch (SQLException e) {
+            logger.error("MySQL接続の確認に失敗しました。", e);
+        }
     }
 
     private void startHeartbeatTask() {
         heartbeatTask = scheduler.scheduleAtFixedRate(() -> {
-            // Jigokuサーバーに接続しているプレイヤーを探す
-            server.getServer(configManager.getString("jigoku_server_name", "jigoku")).ifPresent(jigokuServer -> {
-                Optional<Player> jigokuPlayer = server.getAllPlayers().stream()
-                    .filter(p -> p.getCurrentServer()
-                        .map(s -> s.getServerInfo().getName().equals(configManager.getString("jigoku_server_name", "jigoku")))
-                        .orElse(false))
-                    .findFirst();
-                
-                if (jigokuPlayer.isPresent()) {
-                    // Jigokuにプレイヤーがいる場合、ハートビートを送信
-                    ByteArrayDataOutput out = ByteStreams.newDataOutput();
-                    out.writeUTF("heartbeat");
-                    jigokuServer.sendPluginMessage(CHANNEL, out.toByteArray());
-                } else {
-                    // Jigokuにプレイヤーがいない場合、最後に記録された時刻を使用
-                    // 時刻を推定（20分ごとに1日進む）
-                    Long lastTime = worldTimes.get("jigoku");
-                    if (lastTime != null) {
-                        // 最後の更新から経過した時間を計算し、ゲーム内時間を推定
-                        long elapsedRealSeconds = 30; // 30秒ごとの更新と仮定
-                        long elapsedGameTicks = (elapsedRealSeconds * 20); // 1秒 = 20 ticks
-                        long estimatedTime = (lastTime + elapsedGameTicks) % 24000;
-                        worldTimes.put("jigoku", estimatedTime);
-                        
-                        // 昼夜の判定
-                        boolean wasNight = lastTime >= 12000 && lastTime < 24000;
-                        boolean isNight = estimatedTime >= 12000 && estimatedTime < 24000;
-                        
-                        if (isNight && !wasNight) {
-                            broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-                        } else if (!isNight && wasNight) {
-                            broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-                        }
-                    }
-                }
-            });
-        }, 30, 30, TimeUnit.SECONDS); // 30秒ごとに実行
+            try {
+                sendHeartbeatToJigoku();
+            } catch (Exception e) {
+                logger.error("ハートビートタスクでエラーが発生しました。", e);
+            }
+        }, HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL, TimeUnit.SECONDS);
+    }
+
+    private void sendHeartbeatToJigoku() {
+        server.getServer(configManager.getString("jigoku_server_name", "jigoku")).ifPresent(jigokuServer -> {
+            Optional<Player> jigokuPlayer = findPlayerInServer(jigokuServer.getServerInfo().getName());
+            
+            if (jigokuPlayer.isPresent()) {
+                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                out.writeUTF("heartbeat");
+                jigokuServer.sendPluginMessage(CHANNEL, out.toByteArray());
+            } else {
+                estimateWorldTime("jigoku");
+            }
+        });
+    }
+
+    private Optional<Player> findPlayerInServer(String serverName) {
+        return server.getAllPlayers().stream()
+            .filter(p -> p.getCurrentServer()
+                .map(s -> s.getServerInfo().getName().equals(serverName))
+                .orElse(false))
+            .findFirst();
+    }
+
+    private void estimateWorldTime(String worldName) {
+        Long lastTime = worldTimes.get(worldName);
+        if (lastTime != null) {
+            long elapsedRealSeconds = HEARTBEAT_INTERVAL;
+            long elapsedGameTicks = elapsedRealSeconds * 20;
+            long estimatedTime = (lastTime + elapsedGameTicks) % DAY_TIME;
+            updateWorldTime(worldName, estimatedTime);
+        }
+    }
+
+    private void updateWorldTime(String worldName, long newTime) {
+        Long lastTime = worldTimes.get(worldName);
+        worldTimes.put(worldName, newTime);
+        
+        if (lastTime != null && "jigoku".equals(worldName)) {
+            checkDayNightTransition(lastTime, newTime);
+        }
+    }
+
+    private void checkDayNightTransition(long oldTime, long newTime) {
+        boolean wasNight = isNightTime(oldTime);
+        boolean isNight = isNightTime(newTime);
+        
+        if (isNight && !wasNight) {
+            broadcastToGense(configManager.getString("jigoku_night_message", 
+                "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
+        } else if (!isNight && wasNight) {
+            broadcastToGense(configManager.getString("jigoku_day_message", 
+                "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
+        }
+    }
+
+    private boolean isNightTime(long time) {
+        return time >= NIGHT_START && time < NIGHT_END;
     }
 
     @Subscribe
@@ -238,39 +305,47 @@ public class BanControlPlugin {
         String subChannel = in.readUTF();
         
         try {
-            switch (subChannel) {
-                case "jigoku_transfer":
-                    handleJigokuTransfer(in);
-                    break;
-                case "gense_transfer":
-                    handleGenseTransfer(in);
-                    break;
-                case "gamemode_update":
-                    handleGameModeUpdate(in);
-                    break;
-                case "death_notification": // "death"から変更
-                    handleDeathNotification(in, event);
-                    break;
-                case "night_logout":
-                    handleNightLogout(in);
-                    break;
-                case "jigoku_night":
-                    handleTimeChange(13000L, configManager.getString("jigoku_night_message", 
-                        "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-                    break;
-                case "jigoku_day":
-                    handleTimeChange(1000L, configManager.getString("jigoku_day_message", 
-                        "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-                    break;
-                case "time_state":
-                    handleTimeState(in);
-                    break;
-                case "heartbeat_response":
-                    handleHeartbeatResponse(in);
-                    break;
-            }
+            handlePluginMessage(subChannel, in, event);
         } catch (Exception e) {
-            logger.error("Error handling plugin message: " + subChannel, e);
+            logger.error("プラグインメッセージの処理中にエラーが発生しました: " + subChannel, e);
+        }
+    }
+
+    private void handlePluginMessage(String subChannel, ByteArrayDataInput in, PluginMessageEvent event) {
+        switch (subChannel) {
+            case "jigoku_transfer":
+                handleJigokuTransfer(in);
+                break;
+            case "gense_transfer":
+                handleGenseTransfer(in);
+                break;
+            case "admin_jigoku_transfer":
+                handleAdminJigokuTransfer(in);
+                break;
+            case "admin_gense_transfer":
+                handleAdminGenseTransfer(in);
+                break;
+            case "gamemode_update":
+                handleGameModeUpdate(in);
+                break;
+            case "death_notification":
+                handleDeathNotification(in, event);
+                break;
+            case "night_logout":
+                handleNightLogout(in);
+                break;
+            case "jigoku_night":
+                updateWorldTime("jigoku", 13000L);
+                break;
+            case "jigoku_day":
+                updateWorldTime("jigoku", 1000L);
+                break;
+            case "time_state":
+                handleTimeState(in);
+                break;
+            case "heartbeat_response":
+                handleHeartbeatResponse(in);
+                break;
         }
     }
 
@@ -283,8 +358,7 @@ public class BanControlPlugin {
                 return;
             }
 
-            server.getServer(configManager.getString("jigoku_server_name", "jigoku"))
-                .ifPresent(target -> player.createConnectionRequest(target).fireAndForget());
+            transferToServer(player, getJigokuServerName());
         });
     }
 
@@ -292,18 +366,61 @@ public class BanControlPlugin {
         UUID uuid = UUID.fromString(in.readUTF());
         server.getPlayer(uuid).ifPresent(player -> {
             // 夜間ログアウトのBANチェックのみ
-            BanInfo banInfo = banMap.get(uuid);
-            if (banInfo != null && banInfo.reason == BanInfo.Reason.NIGHT_LOGOUT) {
-                long remainingSeconds = Math.max(0, (banInfo.unbanTime - System.currentTimeMillis()) / 1000);
-                String message = formatBanMessage(banInfo.reason, remainingSeconds);
-                player.sendMessage(Component.text(message));
+            if (checkAndNotifyBan(player, uuid)) {
                 return;
             }
 
             // Genseサーバーへ移動（ペナルティなし）
-            server.getServer(configManager.getString("gense_server_name", "gense"))
-                .ifPresent(target -> player.createConnectionRequest(target).fireAndForget());
+            transferToServer(player, getGenseServerName());
         });
+    }
+
+    // 共通のサーバー転送メソッド
+    private void transferToServer(Player player, String serverName) {
+        server.getServer(serverName).ifPresentOrElse(
+            target -> player.createConnectionRequest(target).fireAndForget(),
+            () -> {
+                player.sendMessage(Component.text("§c転送先のサーバーが見つかりません: " + serverName));
+                logger.error("サーバーが見つかりません: " + serverName);
+            }
+        );
+    }
+
+    // BANチェックの共通化
+    private boolean checkAndNotifyBan(Player player, UUID uuid) {
+        BanInfo banInfo = banMap.get(uuid);
+        if (banInfo != null && banInfo.reason == BanInfo.Reason.NIGHT_LOGOUT) {
+            long remainingSeconds = Math.max(0, (banInfo.unbanTime - System.currentTimeMillis()) / 1000);
+            if (remainingSeconds > 0) {
+                String message = formatBanMessage(banInfo.reason, remainingSeconds);
+                player.sendMessage(Component.text(message));
+                return true;
+            } else {
+                // 期限切れのBANを削除
+                banMap.remove(uuid);
+                saveBans();
+            }
+        }
+        return false;
+    }
+
+    // BANメッセージのフォーマット
+    private String formatBanMessage(BanInfo.Reason reason, long remainingSeconds) {
+        long minutes = remainingSeconds / 60;
+        long seconds = remainingSeconds % 60;
+        
+        String timeString = minutes > 0 
+            ? String.format("%d分%d秒", minutes, seconds)
+            : String.format("%d秒", seconds);
+            
+        switch (reason) {
+            case NIGHT_LOGOUT:
+                return String.format("§c夜間ログアウトペナルティ中です。残り時間: %s", timeString);
+            case DEATH:
+                return String.format("§c死亡ペナルティ中です。残り時間: %s", timeString);
+            default:
+                return String.format("§cペナルティ中です。残り時間: %s", timeString);
+        }
     }
 
     private void handleGameModeUpdate(ByteArrayDataInput in) {
@@ -315,76 +432,70 @@ public class BanControlPlugin {
     private void handleDeathNotification(ByteArrayDataInput in, PluginMessageEvent event) {
         UUID uuid = UUID.fromString(in.readUTF());
         String deathMessage = in.readUTF();
-        boolean isDeathTransfer = in.readBoolean(); // 死亡による転送フラグを読み取る
+        boolean isDeathTransfer = in.readBoolean();
         
         // 死亡フラグのみセット（BANは適用しない）
         deathFlagSet.add(uuid);
         
         // 死亡による転送の場合、一時的にフラグを立てる
         if (isDeathTransfer) {
-            // 夜間退出ペナルティを回避するための一時的なフラグ
-            scheduler.schedule(() -> {
-                // このフラグは自動的に削除されるので、特別な処理は不要
-            }, 10, TimeUnit.SECONDS);
+            // 10秒後に自動削除
+            scheduler.schedule(() -> deathFlagSet.remove(uuid), 10, TimeUnit.SECONDS);
         }
 
         // Genseに死亡情報を転送
-        server.getServer("gense").ifPresent(gense ->
-            gense.sendPluginMessage(event.getIdentifier(), event.getData())
-        );
+        forwardMessageToServer(getGenseServerName(), event.getIdentifier(), event.getData());
 
         // 即座にGenseサーバーへ転送（ペナルティなし）
-        server.getPlayer(uuid).ifPresent(player ->
-            server.getServer("gense").ifPresent(target ->
-                player.createConnectionRequest(target).fireAndForget()
-            )
+        server.getPlayer(uuid).ifPresent(player -> 
+            transferToServer(player, getGenseServerName())
+        );
+    }
+
+    // メッセージ転送の共通化
+    private void forwardMessageToServer(String serverName, ChannelIdentifier identifier, byte[] data) {
+        server.getServer(serverName).ifPresentOrElse(
+            server -> server.sendPluginMessage(identifier, data),
+            () -> logger.warn("サーバー '{}' へのメッセージ転送に失敗しました", serverName)
         );
     }
 
     private void handleNightLogout(ByteArrayDataInput in) {
         UUID uuid = UUID.fromString(in.readUTF());
-        boolean isDeathRelated = in.readBoolean(); // 死亡関連フラグを読み取る
+        boolean isDeathRelated = in.readBoolean();
         
-        // 死亡による転送の場合はペナルティをスキップ
+        if (shouldSkipNightLogoutPenalty(uuid, isDeathRelated)) {
+            return;
+        }
+        
+        applyNightLogoutPenalty(uuid);
+    }
+
+    private boolean shouldSkipNightLogoutPenalty(UUID uuid, boolean isDeathRelated) {
         if (isDeathRelated) {
             logger.info("死亡による転送のため夜間ログアウトペナルティをスキップ: " + uuid);
-            return;
+            return true;
         }
         
-        // 死亡フラグが立っている場合もスキップ
         if (deathFlagSet.contains(uuid)) {
             logger.info("死亡フラグが立っているため夜間ログアウトペナルティをスキップ: " + uuid);
+            return true;
+        }
+        
+        return false;
+    }
+
+    private void applyNightLogoutPenalty(UUID uuid) {
+        long nightLogoutBanDuration = configManager.getInt("ban_after_night_logout_minutes", 10) * 60_000L;
+        
+        BanInfo existingBan = banMap.get(uuid);
+        if (existingBan != null && shouldKeepExistingBan(existingBan, nightLogoutBanDuration)) {
+            logger.info("既存のBANの方が長いため、夜間ログアウトペナルティを適用しません: " + uuid);
             return;
         }
         
-        long nightLogoutBanDuration = configManager.getInt("ban_after_night_logout_minutes", 10) * 60_000L;
+        String playerName = getPlayerName(uuid, existingBan);
         
-        // 既存のBANがある場合は上書きしない（より長いペナルティを優先）
-        BanInfo existingBan = banMap.get(uuid);
-        if (existingBan != null) {
-            long existingRemaining = existingBan.unbanTime - System.currentTimeMillis();
-            long newBanTime = System.currentTimeMillis() + nightLogoutBanDuration;
-            if (existingRemaining > nightLogoutBanDuration) {
-                logger.info("既存のBANの方が長いため、夜間ログアウトペナルティを適用しません: " + uuid);
-                return;
-            }
-        }
-        
-        // プレイヤー名を取得
-        String playerName = "Unknown";
-        Optional<Player> player = server.getPlayer(uuid);
-        if (player.isPresent()) {
-            playerName = player.get().getUsername();
-        } else {
-            // プレイヤーが既にオフラインの場合、既存のBANデータからユーザーネームを取得
-            if (existingBan != null && existingBan.username != null) {
-                playerName = existingBan.username;
-            }
-            // それでも見つからない場合は、過去のデータを確認
-            logger.info("プレイヤーがオフラインのため、UUIDで識別: " + uuid);
-        }
-        
-        // ユーザーネーム付きでBANを記録
         banMap.put(uuid, new BanInfo(
             System.currentTimeMillis() + nightLogoutBanDuration, 
             BanInfo.Reason.NIGHT_LOGOUT,
@@ -394,148 +505,94 @@ public class BanControlPlugin {
         
         logger.info("夜間ログアウトペナルティを適用: " + playerName + " (" + uuid + ")");
         
-        // 他のサーバーのプレイヤーに通知（保存されたユーザーネームを使用）
         String message = String.format("§e%s が夜の地獄から逃げ出したため、%d分間のペナルティが課されました。", 
             playerName, nightLogoutBanDuration / 60_000L);
         broadcastToAllServers(message);
     }
 
-    private void broadcastToAllServers(String message) {
-        server.getAllPlayers().forEach(p -> p.sendMessage(Component.text(message)));
+    private boolean shouldKeepExistingBan(BanInfo existingBan, long newBanDuration) {
+        long existingRemaining = existingBan.unbanTime - System.currentTimeMillis();
+        return existingRemaining > newBanDuration;
     }
 
-    private void handleTimeChange(long time, String message) {
-        Long lastTime = worldTimes.get("jigoku");
-        worldTimes.put("jigoku", time);
-        
-        if (lastTime != null) {
-            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
-            boolean isNight = time >= 12000 && time < 24000;
-            if (isNight && !wasNight) {
-                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-            } else if (!isNight && wasNight) {
-                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-            }
-        } else {
-             broadcastToGense(message);
-        }
+    private String getPlayerName(UUID uuid, BanInfo existingBan) {
+        return server.getPlayer(uuid)
+            .map(Player::getUsername)
+            .orElseGet(() -> {
+                if (existingBan != null && existingBan.username != null) {
+                    return existingBan.username;
+                }
+                logger.info("プレイヤーがオフラインのため、UUIDで識別: " + uuid);
+                return "Unknown";
+            });
     }
 
     private void handleTimeState(ByteArrayDataInput in) {
-        String worldName = in.readUTF();
-        long time = in.readLong();
-        
-        Long lastTime = worldTimes.get(worldName);
-        worldTimes.put(worldName, time);
-
-        if (lastTime != null && "jigoku".equals(worldName)) {
-            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
-            boolean isNight = time >= 12000 && time < 24000;
-            if (isNight && !wasNight) {
-                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-            } else if (!isNight && wasNight) {
-                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-            }
+        String state = in.readUTF();
+        if ("jigoku_night".equals(state)) {
+            updateWorldTime("jigoku", 13000L);
+        } else if ("jigoku_day".equals(state)) {
+            updateWorldTime("jigoku", 1000L);
         }
     }
 
     private void handleHeartbeatResponse(ByteArrayDataInput in) {
+        String state = in.readUTF();
         long time = in.readLong();
-        Long lastTime = worldTimes.get("jigoku");
-        worldTimes.put("jigoku", time);
-
-        if (lastTime != null) {
-            boolean wasNight = lastTime >= 12000 && lastTime < 24000;
-            boolean isNight = time >= 12000 && time < 24000;
-            if (isNight && !wasNight) {
-                broadcastToGense(configManager.getString("jigoku_night_message", "何処かから地鳴りが聞こえる…（地獄ワールドが夜になりました）"));
-            } else if (!isNight && wasNight) {
-                broadcastToGense(configManager.getString("jigoku_day_message", "地獄ワールドの夜は明けました。今なら安全に移動できます！"));
-            }
-        }
+        updateWorldTime("jigoku", time);
     }
 
     private boolean isJigokuNight() {
         if (mysqlEnabled) {
-            try {
-                String query = "SELECT is_night FROM world_times WHERE world_name = 'jigoku'";
-                try (PreparedStatement stmt = mysqlConnection.prepareStatement(query);
-                     ResultSet rs = stmt.executeQuery()) {
-                    if (rs.next()) {
-                        return rs.getBoolean("is_night");
-                    }
-                }
-            } catch (SQLException e) {
-                logger.error("Failed to check Jigoku night status from MySQL", e);
-            }
+            return checkJigokuNightFromMySQL();
         }
         
-        // フォールバック: キャッシュから確認
         Long time = worldTimes.get("jigoku");
-        return time != null && time >= 12000 && time < 24000;
+        return time != null && isNightTime(time);
+    }
+
+    private boolean checkJigokuNightFromMySQL() {
+        if (mysqlConnection == null) return false;
+        
+        String query = "SELECT is_night FROM world_times WHERE world_name = ?";
+        try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+            stmt.setString(1, "jigoku");
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getBoolean("is_night");
+                }
+            }
+        } catch (SQLException e) {
+            logger.error("MySQLからJigokuの夜間状態の確認に失敗しました", e);
+        }
+        
+        // フォールバック
+        Long time = worldTimes.get("jigoku");
+        return time != null && isNightTime(time);
     }
 
     @Subscribe
     public void onServerPostConnect(ServerPostConnectEvent event) {
         Player player = event.getPlayer();
         UUID uuid = player.getUniqueId();
-        String serverName = player.getCurrentServer().map(s -> s.getServerInfo().getName()).orElse("");
+        String serverName = player.getCurrentServer()
+            .map(s -> s.getServerInfo().getName())
+            .orElse("");
 
         // Genseサーバーに接続し、かつdeathフラグが立っている場合
-        if ("gense".equals(serverName) && deathFlagSet.contains(uuid)) {
+        if (getGenseServerName().equals(serverName) && deathFlagSet.remove(uuid)) {
             // Genseに擬似死亡を依頼
-            server.getServer("gense").ifPresent(genseServer -> {
-                ByteArrayDataOutput out = ByteStreams.newDataOutput();
-                out.writeUTF("death_respawn");
-                out.writeUTF(uuid.toString());
-                genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
-            });
-            // フラグを解除
-            deathFlagSet.remove(uuid);
+            sendDeathRespawnRequest(uuid);
         }
     }
 
-    @Subscribe
-    public void onServerPreConnect(ServerPreConnectEvent event) {
-        Player player = event.getPlayer();
-        String serverName = event.getOriginalServer().getServerInfo().getName();
-        UUID playerUuid = player.getUniqueId();
-
-        // 夜間ログアウトのBANチェックのみ
-        BanInfo banInfo = banMap.get(playerUuid);
-        if (banInfo != null && banInfo.reason == BanInfo.Reason.NIGHT_LOGOUT) {
-            long remainingSeconds = Math.max(0, (banInfo.unbanTime - System.currentTimeMillis()) / 1000);
-            
-            // 期限切れのBANは削除
-            if (remainingSeconds <= 0) {
-                banMap.remove(playerUuid);
-                saveBans();
-                return;
-            }
-            
-            // 夜間ログアウトペナルティ中はすべてのサーバーへの接続を制限
-            event.setResult(ServerPreConnectEvent.ServerResult.denied());
-            long remainingMinutes = remainingSeconds / 60;
-            String message = String.format("§c夜間ログアウトペナルティ: あと%d分%d秒待つ必要があります。", 
-                remainingMinutes, remainingSeconds % 60);
-            player.sendMessage(Component.text(message));
-            return;
-        }
-
-        // Jigokuサーバーへの接続時の夜間チェック（BANされていない場合のみ）
-        if (serverName.equals(configManager.getString("jigoku_server_name", "jigoku")) && isJigokuNight()) {
-            event.setResult(ServerPreConnectEvent.ServerResult.denied());
-            player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
-        }
-    }
-
-    private String formatBanMessage(BanInfo.Reason reason, long remainingSeconds) {
-        switch (reason) {
-            case NIGHT_LOGOUT:
-                return String.format("§c夜間にログアウトしたペナルティ中です。残り%d秒後にサーバーに接続できます。", remainingSeconds);
-            default:
-                return String.format("§cあなたは制限されています。残り%d秒", remainingSeconds);
-        }
+    private void sendDeathRespawnRequest(UUID uuid) {
+        server.getServer(getGenseServerName()).ifPresent(genseServer -> {
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("death_respawn");
+            out.writeUTF(uuid.toString());
+            genseServer.sendPluginMessage(CHANNEL, out.toByteArray());
+        });
     }
 
     private void startCleanupTask() {
@@ -554,34 +611,53 @@ public class BanControlPlugin {
     }
 
     private void broadcastToGense(String message) {
-        String gense = configManager.getString("gense_server_name", "gense");
+        broadcastToServer(getGenseServerName(), message);
+    }
+
+    private void broadcastToServer(String serverName, String message) {
         server.getAllPlayers().stream()
-            .filter(p -> p.getCurrentServer().isPresent()
-                && p.getCurrentServer().get().getServerInfo().getName().equals(gense))
+            .filter(p -> p.getCurrentServer()
+                .map(s -> s.getServerInfo().getName().equals(serverName))
+                .orElse(false))
             .forEach(p -> p.sendMessage(Component.text(message)));
     }
 
+    private void broadcastToAllServers(String message) {
+        server.getAllPlayers().forEach(p -> p.sendMessage(Component.text(message)));
+    }
+
     private void loadBans() {
+        if (!banFile.exists() || banFile.length() == 0) return;
+        
         try {
-            if (!banFile.exists() || banFile.length() == 0) return; // ファイルが存在しないか空なら何もしない
             banMap.clear();
             Map<String, BanInfo> tmp = mapper.readValue(banFile, new TypeReference<Map<String, BanInfo>>() {});
-            tmp.forEach((k, v) -> banMap.put(UUID.fromString(k), v));
+            tmp.forEach((k, v) -> {
+                try {
+                    banMap.put(UUID.fromString(k), v);
+                } catch (IllegalArgumentException e) {
+                    logger.error("無効なUUID形式をスキップ: {}", k);
+                }
+            });
+            logger.info("{}件のBANデータを読み込みました", banMap.size());
         } catch (Exception e) {
-            logger.error("Failed to load bans from bans.json", e);
+            logger.error("bans.jsonからのBAN読み込みに失敗しました", e);
         }
     }
 
-    private void saveBans() {
+    private synchronized void saveBans() {
+        if (banMap.isEmpty()) {
+            logger.debug("BANデータが空のため、保存をスキップします");
+            return;
+        }
+        
         try {
             Map<String, BanInfo> toSave = new HashMap<>();
             banMap.forEach((k, v) -> toSave.put(k.toString(), v));
-            if (toSave.isEmpty()) {
-                return; // 空の場合は書き込まない
-            }
             mapper.writerWithDefaultPrettyPrinter().writeValue(banFile, toSave);
+            logger.debug("{}件のBANデータを保存しました", toSave.size());
         } catch (Exception e) {
-            logger.error("Failed to save bans to bans.json", e);
+            logger.error("bans.jsonへのBAN保存に失敗しました", e);
         }
     }
 
@@ -632,6 +708,108 @@ public class BanControlPlugin {
                 }
             } else {
                 invocation.source().sendMessage(Component.text("現世サーバーが見つかりません。"));
+            }
+        }
+    }
+
+    // /admingenseコマンド
+    class AdminGenseCommand implements SimpleCommand {
+        @Override
+        public void execute(Invocation invocation) {
+            if (!(invocation.source() instanceof Player)) {
+                invocation.source().sendMessage(Component.text("このコマンドはプレイヤーのみ実行できます。"));
+                return;
+            }
+            
+            Player player = (Player) invocation.source();
+            
+            // Velocityではパーミッションチェックができないため、
+            // 各サーバー側でOP権限をチェックしてから転送リクエストを送信する仕組みにする
+            player.sendMessage(Component.text("§e管理者権限の確認中..."));
+            player.sendMessage(Component.text("§7※このコマンドはサーバー内で /admingense を実行してください。"));
+        }
+    }
+
+    // /adminjigokuコマンド
+    class AdminJigokuCommand implements SimpleCommand {
+        @Override
+        public void execute(Invocation invocation) {
+            if (!(invocation.source() instanceof Player)) {
+                invocation.source().sendMessage(Component.text("このコマンドはプレイヤーのみ実行できます。"));
+                return;
+            }
+            
+            Player player = (Player) invocation.source();
+            
+            // Velocityではパーミッションチェックができないため、
+            // 各サーバー側でOP権限をチェックしてから転送リクエストを送信する仕組みにする
+            player.sendMessage(Component.text("§e管理者権限の確認中..."));
+            player.sendMessage(Component.text("§7※このコマンドはサーバー内で /adminjigoku を実行してください。"));
+        }
+    }
+
+    private void handleAdminJigokuTransfer(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        server.getPlayer(uuid).ifPresent(player -> {
+            // 管理者権限チェック（Velocityではパーミッションチェックは各サーバー側で行う）
+            transferToServer(player, getJigokuServerName());
+            player.sendMessage(Component.text("§a[管理者] 地獄サーバーへ強制転送しました。"));
+        });
+    }
+
+    private void handleAdminGenseTransfer(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        server.getPlayer(uuid).ifPresent(player -> {
+            // 管理者権限チェック（Velocityではパーミッションチェックは各サーバー側で行う）
+            transferToServer(player, getGenseServerName());
+            player.sendMessage(Component.text("§a[管理者] 現世サーバーへ強制転送しました。"));
+        });
+    }
+
+    // サーバー名取得の共通化
+    private String getJigokuServerName() {
+        return configManager.getString("jigoku_server_name", "jigoku");
+    }
+
+    private String getGenseServerName() {
+        return configManager.getString("gense_server_name", "gense");
+    }
+
+    private void cleanup() {
+        // スケジューラのシャットダウン
+        shutdownScheduler();
+        
+        // MySQL接続のクローズ
+        closeMySQLConnection();
+    }
+
+    private void shutdownScheduler() {
+        if (heartbeatTask != null && !heartbeatTask.isCancelled()) {
+            heartbeatTask.cancel(true);
+        }
+        
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                    scheduler.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                scheduler.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void closeMySQLConnection() {
+        if (mysqlConnection != null) {
+            try {
+                if (!mysqlConnection.isClosed()) {
+                    mysqlConnection.close();
+                    logger.info("MySQL接続を正常にクローズしました");
+                }
+            } catch (SQLException e) {
+                logger.error("MySQL接続のクローズに失敗しました", e);
             }
         }
     }
