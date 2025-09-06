@@ -37,8 +37,8 @@ import java.util.concurrent.*;
 public class BanControlPlugin {
 
     private static final MinecraftChannelIdentifier CHANNEL = MinecraftChannelIdentifier.create("myserver", "bancontrol");
-    private static final long NIGHT_START = 12000L;
-    private static final long NIGHT_END = 24000L;
+    private static final long NIGHT_START = 13000L;  // 12000L から 13000L に変更
+    private static final long NIGHT_END = 23000L;   // 24000L から 23000L に変更
     private static final long DAY_TIME = 24000L;
     private static final int HEARTBEAT_INTERVAL = 30;
     private static final int MYSQL_HEARTBEAT_INTERVAL = 5;
@@ -125,15 +125,8 @@ public class BanControlPlugin {
             server.getCommandManager().metaBuilder("gense").build(), 
             new GenseCommand()
         );
-        // 管理者用コマンドを追加
-        server.getCommandManager().register(
-            server.getCommandManager().metaBuilder("admingense").build(), 
-            new AdminGenseCommand()
-        );
-        server.getCommandManager().register(
-            server.getCommandManager().metaBuilder("adminjigoku").build(), 
-            new AdminJigokuCommand()
-        );
+        // 管理者用コマンドの登録を削除
+        // 各サーバー側で直接処理するため
     }
 
     private void initializeMySQL() {
@@ -159,8 +152,10 @@ public class BanControlPlugin {
         String password = config.getString("password", "password");
 
         try {
-            String url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&autoReconnect=true", 
-                host, port, database);
+            String url = String.format(
+                "jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&autoReconnect=true&allowPublicKeyRetrieval=true",
+                host, port, database
+            );
             mysqlConnection = DriverManager.getConnection(url, username, password);
             mysqlEnabled = true;
 
@@ -181,7 +176,7 @@ public class BanControlPlugin {
                 "time BIGINT NOT NULL," +
                 "is_night BOOLEAN NOT NULL," +
                 "last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" +
-                ")"
+                ");" // セミコロンを追加
             );
         } catch (SQLException e) {
             logger.error("world_timesテーブルの作成に失敗しました。", e);
@@ -345,6 +340,9 @@ public class BanControlPlugin {
                 break;
             case "heartbeat_response":
                 handleHeartbeatResponse(in);
+                break;
+            case "query_jigoku_time":
+                handleJigokuTimeQuery(in, event);
                 break;
         }
     }
@@ -712,42 +710,6 @@ public class BanControlPlugin {
         }
     }
 
-    // /admingenseコマンド
-    class AdminGenseCommand implements SimpleCommand {
-        @Override
-        public void execute(Invocation invocation) {
-            if (!(invocation.source() instanceof Player)) {
-                invocation.source().sendMessage(Component.text("このコマンドはプレイヤーのみ実行できます。"));
-                return;
-            }
-            
-            Player player = (Player) invocation.source();
-            
-            // Velocityではパーミッションチェックができないため、
-            // 各サーバー側でOP権限をチェックしてから転送リクエストを送信する仕組みにする
-            player.sendMessage(Component.text("§e管理者権限の確認中..."));
-            player.sendMessage(Component.text("§7※このコマンドはサーバー内で /admingense を実行してください。"));
-        }
-    }
-
-    // /adminjigokuコマンド
-    class AdminJigokuCommand implements SimpleCommand {
-        @Override
-        public void execute(Invocation invocation) {
-            if (!(invocation.source() instanceof Player)) {
-                invocation.source().sendMessage(Component.text("このコマンドはプレイヤーのみ実行できます。"));
-                return;
-            }
-            
-            Player player = (Player) invocation.source();
-            
-            // Velocityではパーミッションチェックができないため、
-            // 各サーバー側でOP権限をチェックしてから転送リクエストを送信する仕組みにする
-            player.sendMessage(Component.text("§e管理者権限の確認中..."));
-            player.sendMessage(Component.text("§7※このコマンドはサーバー内で /adminjigoku を実行してください。"));
-        }
-    }
-
     private void handleAdminJigokuTransfer(ByteArrayDataInput in) {
         UUID uuid = UUID.fromString(in.readUTF());
         server.getPlayer(uuid).ifPresent(player -> {
@@ -811,6 +773,103 @@ public class BanControlPlugin {
             } catch (SQLException e) {
                 logger.error("MySQL接続のクローズに失敗しました", e);
             }
+        }
+    }
+
+    private void handleJigokuTimeQuery(ByteArrayDataInput in, PluginMessageEvent event) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        server.getPlayer(uuid).ifPresent(player -> {
+            if (mysqlEnabled) {
+                // MySQLから時刻情報を取得して返す
+                queryJigokuTimeFromMySQL(player);
+            } else {
+                // 推定時刻を返す
+                Long time = worldTimes.get("jigoku");
+                if (time != null) {
+                    sendJigokuTimeResponse(player, time, isNightTime(time));
+                } else {
+                    player.sendMessage(Component.text("§c地獄ワールドの時刻情報がありません。"));
+                }
+            }
+        });
+    }
+
+    private void queryJigokuTimeFromMySQL(Player player) {
+        if (!mysqlEnabled || mysqlConnection == null) {
+            player.sendMessage(Component.text("§cMySQL接続が利用できません。"));
+            return;
+        }
+        
+        scheduler.execute(() -> {
+            String query = "SELECT time, is_night, last_update FROM world_times WHERE world_name = ?";
+            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+                stmt.setString(1, "jigoku");
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        long time = rs.getLong("time");
+                        boolean isNight = rs.getBoolean("is_night");
+                        Timestamp lastUpdate = rs.getTimestamp("last_update");
+                        
+                        // 結果を送信
+                        sendJigokuTimeResponseWithDetails(player, time, isNight, lastUpdate);
+                    } else {
+                        player.sendMessage(Component.text("§c地獄ワールドの時刻情報が見つかりません。"));
+                    }
+                }
+            } catch (SQLException e) {
+                logger.error("MySQLから時刻情報の取得に失敗しました。", e);
+                player.sendMessage(Component.text("§cデータベースエラーが発生しました。"));
+            }
+        });
+    }
+
+    private void sendJigokuTimeResponse(Player player, long time, boolean isNight) {
+        long normalizedTime = time % 24000;
+        
+        player.sendMessage(Component.text("§6=== 地獄ワールドの時刻情報 ==="));
+        player.sendMessage(Component.text(String.format("§e現在時刻: §f%d §7/ 24000", normalizedTime)));
+        player.sendMessage(Component.text(String.format("§e時間帯: %s", isNight ? "§c夜" : "§a昼")));
+        
+        if (isNight) {
+            long ticksUntilDay = 23000 - normalizedTime;  // 24000 から 23000 に変更
+            long secondsUntilDay = ticksUntilDay / 20;
+            player.sendMessage(Component.text(String.format("§e朝まで: §f%d秒 §7(%dティック)", secondsUntilDay, ticksUntilDay)));
+            player.sendMessage(Component.text("§c※ 夜間は/genseコマンドが使用できません"));
+        } else {
+            long ticksUntilNight = 13000 - normalizedTime;  // 12000 から 13000 に変更
+            if (ticksUntilNight < 0) ticksUntilNight += 24000;
+            long secondsUntilNight = ticksUntilNight / 20;
+            player.sendMessage(Component.text(String.format("§e夜まで: §f%d秒 §7(%dティック)", secondsUntilNight, ticksUntilNight)));
+            player.sendMessage(Component.text("§a※ 昼間は/genseコマンドで現世に戻れます"));
+        }
+    }
+
+    private void sendJigokuTimeResponseWithDetails(Player player, long time, boolean isNight, Timestamp lastUpdate) {
+        long normalizedTime = time % 24000;
+        
+        player.sendMessage(Component.text("§6=== 地獄ワールドの時刻情報 ==="));
+        player.sendMessage(Component.text(String.format("§e現在時刻: §f%d §7/ 24000", normalizedTime)));
+        player.sendMessage(Component.text(String.format("§e時間帯: %s §7(DB: %s)", 
+            isNight ? "§c夜" : "§a昼",
+            isNight ? "夜" : "昼")));
+        
+        if (isNight) {
+            long ticksUntilDay = 23000 - normalizedTime;  // 24000 から 23000 に変更
+            long secondsUntilDay = ticksUntilDay / 20;
+            player.sendMessage(Component.text(String.format("§e朝まで: §f%d秒 §7(%dティック)", secondsUntilDay, ticksUntilDay)));
+            player.sendMessage(Component.text("§c※ 夜間は/genseコマンドが使用できません"));
+        } else {
+            long ticksUntilNight = 13000 - normalizedTime;  // 12000 から 13000 に変更
+            if (ticksUntilNight < 0) ticksUntilNight += 24000;
+            long secondsUntilNight = ticksUntilNight / 20;
+            player.sendMessage(Component.text(String.format("§e夜まで: §f%d秒 §7(%dティック)", secondsUntilNight, ticksUntilNight)));
+            player.sendMessage(Component.text("§a※ 昼間は/genseコマンドで現世に戻れます"));
+        }
+        
+        // 最終更新時刻を表示
+        if (lastUpdate != null) {
+            long secondsAgo = (System.currentTimeMillis() - lastUpdate.getTime()) / 1000;
+            player.sendMessage(Component.text(String.format("§7最終更新: %d秒前", secondsAgo)));
         }
     }
 }

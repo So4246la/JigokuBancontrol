@@ -43,8 +43,8 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private static final String CHANNEL = "myserver:bancontrol";
     private static final String BUNGEECORD_CHANNEL = "BungeeCord";
     private static final long DAY_TIME = 24000L;
-    private static final long NIGHT_START = 12000L;
-    private static final long NIGHT_END = 24000L;
+    private static final long NIGHT_START = 13000L;  // 12000L から 13000L に変更
+    private static final long NIGHT_END = 23000L;    // 24000L から 23000L に変更
     private static final int TIME_CHECK_INTERVAL = 100; // 5秒 (100 ticks)
     private static final long PENDING_MESSAGE_EXPIRE_TIME = 86400000L; // 24時間
     
@@ -62,7 +62,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
 
     private boolean isNight(World world) {
         long time = world.getTime();
-        return time >= 12000 && time < 24000;
+        return time >= 13000 && time < 23000;  // 24000 から 23000 に変更
     }
 
     @Override
@@ -81,6 +81,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
         Bukkit.getPluginManager().registerEvents(this, this);
         this.getCommand("gense").setExecutor(this);
         this.getCommand("admingense").setExecutor(this);
+        this.getCommand("jigokutime").setExecutor(this);
         
         getLogger().info("JigokuBanControlが有効になりました。");
         
@@ -713,17 +714,17 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             getLogger().info(String.format("プレイヤー: %s", player.getName()));
             getLogger().info(String.format("ワールド: %s", world.getName()));
             getLogger().info(String.format("現在時刻: %d", time));
-            getLogger().info(String.format("夜判定: %b (12000-24000の範囲: %b)", nightCheck, (time >= 12000 && time < 24000)));
+            getLogger().info(String.format("夜判定: %b (13000-23000の範囲: %b)", nightCheck, (time >= 13000 && time < 23000)));  // 24000 から 23000 に変更
             getLogger().info(String.format("wasNight状態: %b", wasNight));
             
             // 時刻を0-24000の範囲に正規化（念のため）
             long normalizedTime = time % 24000;
-            boolean isNightTime = normalizedTime >= 12000 && normalizedTime < 24000;
+            boolean isNightTime = normalizedTime >= 13000 && normalizedTime < 23000;  // 24000 から 23000 に変更
             
             if (isNightTime) {
                 player.sendMessage("§c夜の地獄からは脱出できません。朝まで待ってください。");
                 player.sendMessage("§7(現在の時刻: " + normalizedTime + "/24000)");
-                player.sendMessage("§7(朝になるまで: " + (24000 - normalizedTime) + "ティック)");
+                player.sendMessage("§7(朝になるまで: " + (23000 - normalizedTime) + "ティック)");  // 24000 から 23000 に変更
                 
                 // 管理者向けデバッグ情報（必要に応じて）
                 if (player.hasPermission("jigokuban.debug")) {
@@ -761,9 +762,115 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             player.sendMessage("§a[管理者] 現世への強制転送を開始します...");
             getLogger().info(String.format("[管理者転送] %s が現世への強制転送を実行しました。", player.getName()));
             return true;
+        } else if (command.getName().equalsIgnoreCase("jigokutime")) {
+            // 地獄の時間を表示
+            showJigokuTime(player);
+            return true;
         }
 
         return false;
+    }
+
+    private void showJigokuTime(Player player) {
+        if (mysqlEnabled) {
+            // MySQLから時刻情報を取得
+            getJigokuTimeFromMySQL(player);
+        } else {
+            // ローカルワールドから時刻情報を取得
+            World world = getMainWorld();
+            if (world != null) {
+                displayTimeInfo(player, world.getTime());
+            } else {
+                player.sendMessage("§c時刻情報を取得できませんでした。");
+            }
+        }
+    }
+
+    private void getJigokuTimeFromMySQL(Player player) {
+        if (!mysqlEnabled || mysqlConnection == null) {
+            player.sendMessage("§cMySQL接続が利用できません。");
+            return;
+        }
+        
+        // 非同期でMySQLから時刻を取得
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            String query = "SELECT time, is_night, last_update FROM world_times WHERE world_name = ?";
+            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+                stmt.setString(1, "jigoku");
+                try (ResultSet rs = stmt.executeQuery()) {
+                    if (rs.next()) {
+                        long time = rs.getLong("time");
+                        boolean isNight = rs.getBoolean("is_night");
+                        Timestamp lastUpdate = rs.getTimestamp("last_update");
+                        
+                        // メインスレッドで結果を表示
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            displayTimeInfoWithDetails(player, time, isNight, lastUpdate);
+                        });
+                    } else {
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            player.sendMessage("§c地獄ワールドの時刻情報が見つかりません。");
+                        });
+                    }
+                }
+            } catch (SQLException e) {
+                getLogger().log(Level.WARNING, "MySQLから時刻情報の取得に失敗しました。", e);
+                Bukkit.getScheduler().runTask(this, () -> {
+                    player.sendMessage("§cデータベースエラーが発生しました。");
+                });
+            }
+        });
+    }
+
+    private void displayTimeInfo(Player player, long time) {
+        long normalizedTime = time % 24000;
+        boolean isNight = normalizedTime >= 13000 && normalizedTime < 23000;  // 24000 から 23000 に変更
+        
+        player.sendMessage("§6=== 地獄ワールドの時刻情報 ===");
+        player.sendMessage(String.format("§e現在時刻: §f%d §7/ 24000", normalizedTime));
+        player.sendMessage(String.format("§e時間帯: %s", isNight ? "§c夜" : "§a昼"));
+        
+        if (isNight) {
+            long ticksUntilDay = 23000 - normalizedTime;  // 24000 から 23000 に変更
+            long secondsUntilDay = ticksUntilDay / 20;
+            player.sendMessage(String.format("§e朝まで: §f%d秒 §7(%dティック)", secondsUntilDay, ticksUntilDay));
+            player.sendMessage("§c※ 夜間は/genseコマンドが使用できません");
+        } else {
+            long ticksUntilNight = 13000 - normalizedTime;  // 12000 から 13000 に変更
+            if (ticksUntilNight < 0) ticksUntilNight += 24000;
+            long secondsUntilNight = ticksUntilNight / 20;
+            player.sendMessage(String.format("§e夜まで: §f%d秒 §7(%dティック)", secondsUntilNight, ticksUntilNight));
+            player.sendMessage("§a※ 昼間は/genseコマンドで現世に戻れます");
+        }
+    }
+
+    private void displayTimeInfoWithDetails(Player player, long time, boolean isNight, Timestamp lastUpdate) {
+        long normalizedTime = time % 24000;
+        
+        player.sendMessage("§6=== 地獄ワールドの時刻情報 ===");
+        player.sendMessage(String.format("§e現在時刻: §f%d §7/ 24000", normalizedTime));
+        player.sendMessage(String.format("§e時間帯: %s §7(DB: %s)", 
+            isNight ? "§c夜" : "§a昼",
+            isNight ? "夜" : "昼"));
+        
+        if (isNight) {
+            long ticksUntilDay = 23000 - normalizedTime;  // 24000 から 23000 に変更
+            long secondsUntilDay = ticksUntilDay / 20;
+            player.sendMessage(String.format("§e朝まで: §f%d秒 §7(%dティック)", secondsUntilDay, ticksUntilDay));
+            player.sendMessage("§c※ 夜間は/genseコマンドが使用できません");
+        } else {
+            long ticksUntilNight = 13000 - normalizedTime;  // 12000 から 13000 に変更
+            if (ticksUntilNight < 0) ticksUntilNight += 24000;
+            long secondsUntilNight = ticksUntilNight / 20;
+            player.sendMessage(String.format("§e夜まで: §f%d秒 §7(%dティック)", secondsUntilNight, ticksUntilNight));
+            player.sendMessage("§a※ 昼間は/genseコマンドで現世に戻れます");
+        }
+        
+        // 最終更新時刻を表示
+        if (lastUpdate != null) {
+            long secondsAgo = (System.currentTimeMillis() - lastUpdate.getTime()) / 1000;
+            player.sendMessage(String.format("§7最終更新: %d秒前", secondsAgo));
+        }
     }
 
     private void connectToServer(Player player, String serverName) {

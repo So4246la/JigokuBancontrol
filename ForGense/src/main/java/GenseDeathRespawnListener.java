@@ -47,6 +47,7 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
     private void registerCommands() {
         this.getCommand("jigoku").setExecutor(this);
         this.getCommand("adminjigoku").setExecutor(this);
+        this.getCommand("jigokutime").setExecutor(this);
     }
 
     @Override
@@ -152,6 +153,10 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
             // 管理者用の地獄転送
             requestAdminJigokuTransfer(player);
             return true;
+        } else if (command.getName().equalsIgnoreCase("jigokutime")) {
+            // Velocityに時刻情報をリクエスト
+            requestJigokuTime(player);
+            return true;
         }
         
         return false;
@@ -172,6 +177,14 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
         
         player.sendMessage("§a[管理者] 地獄への強制転送を開始します...");
         getLogger().info(String.format("[管理者転送] %s が地獄への強制転送を実行しました。", player.getName()));
+    }
+
+    private void requestJigokuTime(Player player) {
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("query_jigoku_time");
+        out.writeUTF(player.getUniqueId().toString());
+        player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+        player.sendMessage("§e地獄ワールドの時刻を確認中...");
     }
 
     @EventHandler

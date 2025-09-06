@@ -11,6 +11,10 @@ commands:
     description: 管理者用 - 制限なく現世サーバーに移動します
     usage: /<command>
     permission: jigokubancontrol.admin
+  jigokutime:
+    description: 地獄ワールドの現在時刻を確認します
+    usage: /<command>
+    permission: jigokubancontrol.time
 permissions:
   jigokubancontrol.gense:
     description: 現世サーバーへの移動を許可します
@@ -18,3 +22,6 @@ permissions:
   jigokubancontrol.admin:
     description: 管理者用コマンドの使用を許可します
     default: op
+  jigokubancontrol.time:
+    description: 地獄の時刻確認を許可します
+    default: true

@@ -1,20 +1,20 @@
 name: GenseDeathRespawnListener
 main: jp.example.gense.GenseDeathRespawnListener
 version: 1.0
-api-version: 1.20
-author: So4246la
-description: 現世サーバーで地獄から死亡後リスポーンした際に擬似リスポーンイベントを発火する
-depend: []
-softdepend: []
+api-version: 1.13
 commands:
   jigoku:
-    description: 地獄サーバーへ移動します。
-    usage: /jigoku
+    description: 地獄サーバーに移動します
+    usage: /<command>
   adminjigoku:
-    description: 管理者用 - 制限なく地獄サーバーへ移動します。
-    usage: /adminjigoku
+    description: 管理者用 - 制限なく地獄サーバーに移動します
+    usage: /<command>
     permission: gense.admin
+  jigokutime:
+    description: 地獄ワールドの現在時刻を確認します
+    usage: /<command>
 permissions:
   gense.admin:
     description: 管理者用コマンドの使用を許可します
+    default: op
     default: op
