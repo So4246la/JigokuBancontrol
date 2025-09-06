@@ -2,6 +2,8 @@ name: GenseDeathRespawnListener
 main: jp.example.gense.GenseDeathRespawnListener
 version: 1.0
 api-version: 1.13
+softdepend:
+  - HuskSync
 commands:
   jigoku:
     description: 地獄サーバーに移動します

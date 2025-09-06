@@ -21,6 +21,8 @@ import java.util.Collection;
 import java.util.UUID;
 import java.util.logging.Level;
 
+import jp.example.gense.HuskSyncHook;
+
 public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessageListener, Listener, CommandExecutor {
 
     private static final String CHANNEL = "myserver:bancontrol";
@@ -30,9 +32,14 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
     private static final String GAMEMODE_RESPONSE_SUBCHANNEL = "gamemode_response";
     private static final String JIGOKU_TRANSFER_SUBCHANNEL = "jigoku_transfer";
     private static final String GAMEMODE_UPDATE_SUBCHANNEL = "gamemode_update";
+    
+    private HuskSyncHook huskSyncHook;
 
     @Override
     public void onEnable() {
+        // HuskSync統合を初期化
+        this.huskSyncHook = new HuskSyncHook(this);
+        
         registerChannels();
         getServer().getPluginManager().registerEvents(this, this);
         registerCommands();
@@ -163,19 +170,33 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
     }
 
     private void requestJigokuTransfer(Player player) {
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        out.writeUTF(JIGOKU_TRANSFER_SUBCHANNEL);
-        out.writeUTF(player.getUniqueId().toString());
-        player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+        player.sendMessage("§c地獄への転送を開始します...");
+        
+        // HuskSyncでプレイヤーデータを保存してから転送
+        huskSyncHook.savePlayerDataAndThen(player, () -> {
+            // データ保存完了後にVelocityに転送リクエストを送信
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF(JIGOKU_TRANSFER_SUBCHANNEL);
+            out.writeUTF(player.getUniqueId().toString());
+            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+            
+            getLogger().info("HuskSyncデータ保存完了後、地獄転送を実行: " + player.getName());
+        });
     }
 
     private void requestAdminJigokuTransfer(Player player) {
-        ByteArrayDataOutput out = ByteStreams.newDataOutput();
-        out.writeUTF("admin_jigoku_transfer");
-        out.writeUTF(player.getUniqueId().toString());
-        player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-        
         player.sendMessage("§a[管理者] 地獄への強制転送を開始します...");
+        
+        // HuskSyncでプレイヤーデータを保存してから転送
+        huskSyncHook.savePlayerDataAndThen(player, () -> {
+            // データ保存完了後にVelocityに転送リクエストを送信
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF("admin_jigoku_transfer");
+            out.writeUTF(player.getUniqueId().toString());
+            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+            
+            getLogger().info("HuskSyncデータ保存完了後、管理者地獄転送を実行: " + player.getName());
+        });
         getLogger().info(String.format("[管理者転送] %s が地獄への強制転送を実行しました。", player.getName()));
     }
 

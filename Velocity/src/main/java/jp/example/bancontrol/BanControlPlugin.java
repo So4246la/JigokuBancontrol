@@ -9,7 +9,6 @@ import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
-import com.velocitypowered.api.event.player.ServerPreConnectEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.proxy.Player;
@@ -18,15 +17,12 @@ import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.api.proxy.messages.ChannelIdentifier;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
-import jp.example.bancontrol.ConfigManager; // Add this import
-import jp.example.bancontrol.BanInfo; // Add this import
-import net.kyori.adventure.key.Key; // Add this import
+// 同一パッケージ内のため import は不要
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
 
 import javax.inject.Inject;
 import java.io.*;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.*;
@@ -55,8 +51,7 @@ public class BanControlPlugin {
     private ConfigManager configManager;
     private final Map<UUID, String> gameModeCache = new ConcurrentHashMap<>();
     private final Map<String, Long> worldTimes = new ConcurrentHashMap<>();
-    private final Map<UUID, CompletableFuture<String>> pendingGameModeQueries = new ConcurrentHashMap<>();
-    private final Map<UUID, CompletableFuture<Long>> pendingTimeQueries = new ConcurrentHashMap<>();
+    // 未使用の保留クエリは削除
     private ScheduledFuture<?> heartbeatTask; // 追加
     private Connection mysqlConnection;
     private boolean mysqlEnabled = false;
@@ -436,9 +431,10 @@ public class BanControlPlugin {
 
     private void handleDeathNotification(ByteArrayDataInput in, PluginMessageEvent event) {
         UUID uuid = UUID.fromString(in.readUTF());
-        String deathMessage = in.readUTF();
+    String deathMessage = in.readUTF();
         boolean isDeathTransfer = in.readBoolean();
-        
+    // 参考ログ（内容確認用）
+    logger.debug("death_notification: message='{}' isDeathTransfer={}", deathMessage, isDeathTransfer);
         // 死亡フラグのみセット（BANは適用しない）
         deathFlagSet.add(uuid);
         
@@ -547,8 +543,9 @@ public class BanControlPlugin {
     }
 
     private void handleHeartbeatResponse(ByteArrayDataInput in) {
-        String state = in.readUTF();
+    String state = in.readUTF();
         long time = in.readLong();
+    logger.debug("heartbeat_response: state='{}' time={}", state, time);
         updateWorldTime("jigoku", time);
     }
 
@@ -671,17 +668,7 @@ public class BanControlPlugin {
         }
     }
 
-    // Configファイル読み込みの本実装は各自で。ここはサンプル
-    private String getConfig(String key) {
-        return configManager.getString(key, "");
-    }
-    private int getConfigMinutes(String key) {
-        switch (key) {
-            case "ban_after_death_minutes": return configManager.getInt("ban_after_death_minutes", 5);
-            case "ban_after_night_logout_minutes": return configManager.getInt("ban_after_night_logout_minutes", 5);
-            default: return 5;
-        }
-    }
+    // Config参照は configManager.* を直接使用
 
     // /unbanコマンド
     class UnbanCommand implements SimpleCommand {

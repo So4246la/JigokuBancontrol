@@ -12,6 +12,7 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.Material;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -38,6 +39,8 @@ import java.io.File;
 import java.io.IOException;
 import java.sql.*;
 
+import jp.example.jigokubancontrol.HuskSyncHook;
+
 public class JigokuBanControlPlugin extends JavaPlugin implements Listener, PluginMessageListener, CommandExecutor {
 
     private static final String CHANNEL = "myserver:bancontrol";
@@ -59,6 +62,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private boolean wasNight = false; // 最後にチェックした時の夜かどうかを保持
     private Connection mysqlConnection;
     private boolean mysqlEnabled = false;
+    private HuskSyncHook huskSyncHook;
 
     private boolean isNight(World world) {
         long time = world.getTime();
@@ -73,6 +77,19 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
 
         // MySQL接続を初期化
         initializeMySQL();
+
+        // HuskSync統合を初期化（存在チェック＆互換性エラーに耐性）
+        try {
+            if (getServer().getPluginManager().getPlugin("HuskSync") != null) {
+                this.huskSyncHook = new HuskSyncHook(this);
+            } else {
+                getLogger().info("HuskSyncが見つからないため統合は無効です。");
+                this.huskSyncHook = null;
+            }
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "HuskSync統合の初期化に失敗しました（未導入/互換性の可能性）。統合を無効化します。", t);
+            this.huskSyncHook = null;
+        }
 
         // チャンネル登録
         registerChannels();
@@ -125,6 +142,12 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
         return getServer().getWorlds().isEmpty() ? null : getServer().getWorlds().get(0);
     }
 
+    // 夜間判定に使用するワールド（メインワールド優先／フォールバックはプレイヤーのワールド）
+    private World getWorldForNightCheck(Player player) {
+        World main = getMainWorld();
+        return (main != null) ? main : player.getWorld();
+    }
+
     private void checkAndUpdateTimeState(World world) {
         boolean isCurrentlyNight = isNight(world);
         
@@ -150,6 +173,21 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
             : "§a朝が訪れました。/gense で現世に戻ることができます。";
         
         Bukkit.getOnlinePlayers().forEach(player -> player.sendMessage(message));
+    }
+
+    // HuskSyncが使えない場合はそのまま実行する安全な呼び出し
+    private void saveWithHuskSyncOrRun(Player player, Runnable callback) {
+        try {
+            if (this.huskSyncHook != null && this.huskSyncHook.isEnabled()) {
+                this.huskSyncHook.savePlayerDataAndThen(player, callback);
+            } else {
+                getLogger().info("[HuskSyncHook] 無効または未導入のため保存をスキップ: " + player.getName());
+                callback.run();
+            }
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "HuskSync保存呼び出し中にエラー。保存をスキップして続行します: " + player.getName(), t);
+            callback.run();
+        }
     }
 
     private void initializeMySQL() {
@@ -302,6 +340,14 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         sendPluginMessage(out.toByteArray());
     }
 
+    // デバッグ: 権限保持者が実行したコマンドをログ出力（他プラグインに奪われていないかの切り分け）
+    @EventHandler(ignoreCancelled = true)
+    public void onPlayerCommandPreprocess(PlayerCommandPreprocessEvent event) {
+        if (event.getPlayer().hasPermission("jigokuban.debug")) {
+            getLogger().info(String.format("[DEBUG] CommandPreprocess by %s: %s", event.getPlayer().getName(), event.getMessage()));
+        }
+    }
+
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
@@ -314,8 +360,8 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             return;
         }
         
-        // 夜間ログアウトの処理
-        if (isNight(player.getWorld())) {
+    // 夜間ログアウトの処理（メインワールド基準）
+    if (isNight(getWorldForNightCheck(player))) {
             handleNightLogout(player);
         }
     }
@@ -704,16 +750,17 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         Player player = (Player) sender;
 
         if (command.getName().equalsIgnoreCase("gense")) {
-            // 夜間チェック
-            World world = player.getWorld();
+            // 夜間チェック（メインワールド基準で評価）
+            World playerWorld = player.getWorld();
+            World world = getWorldForNightCheck(player);
             long time = world.getTime();
             boolean nightCheck = isNight(world);
             
             // デバッグ情報を詳細に出力
             getLogger().info(String.format("=== Genseコマンド実行 ==="));
             getLogger().info(String.format("プレイヤー: %s", player.getName()));
-            getLogger().info(String.format("ワールド: %s", world.getName()));
-            getLogger().info(String.format("現在時刻: %d", time));
+            getLogger().info(String.format("判定ワールド: %s (プレイヤーワールド: %s)", world.getName(), playerWorld.getName()));
+            getLogger().info(String.format("現在時刻(判定): %d / 現在時刻(プレイヤー): %d", time, playerWorld.getTime()));
             getLogger().info(String.format("夜判定: %b (13000-23000の範囲: %b)", nightCheck, (time >= 13000 && time < 23000)));  // 24000 から 23000 に変更
             getLogger().info(String.format("wasNight状態: %b", wasNight));
             
@@ -736,15 +783,25 @@ public void onPlayerDeath(PlayerDeathEvent event) {
 
             // 昼間の場合のみ転送処理を実行
             getLogger().info("昼間と判定されたため、転送処理を開始します。");
-            
-            // Velocityに転送リクエストを送信
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF("gense_transfer");
-            out.writeUTF(player.getUniqueId().toString());
-            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+            // 追加デバッグ: HuskSync状態をログ
+            boolean huskSyncEnabledNow = (this.huskSyncHook != null && this.huskSyncHook.isEnabled());
+            boolean huskSyncPluginPresent = (getServer().getPluginManager().getPlugin("HuskSync") != null);
+            getLogger().info(String.format("[DEBUG] HuskSync present=%b, hookEnabled=%b", huskSyncPluginPresent, huskSyncEnabledNow));
             
             player.sendMessage("§a現世への移動を開始します...");
             player.sendMessage("§7(現在の時刻: " + normalizedTime + "/24000 - 昼間)");
+            
+            // HuskSyncでプレイヤーデータを保存してから転送（安全ラッパー）
+            saveWithHuskSyncOrRun(player, () -> {
+                // データ保存完了後にVelocityに転送リクエストを送信
+                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                out.writeUTF("gense_transfer");
+                out.writeUTF(player.getUniqueId().toString());
+                player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+                
+                getLogger().info("HuskSyncデータ保存完了後、現世転送を実行: " + player.getName());
+            });
+            
             return true;
         } else if (command.getName().equalsIgnoreCase("admingense")) {
             // OP権限チェック
@@ -754,13 +811,23 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             }
             
             // 管理者用の現世転送
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF("admin_gense_transfer");
-            out.writeUTF(player.getUniqueId().toString());
-            sendPluginMessage(out.toByteArray());
-            
             player.sendMessage("§a[管理者] 現世への強制転送を開始します...");
             getLogger().info(String.format("[管理者転送] %s が現世への強制転送を実行しました。", player.getName()));
+            // 追加デバッグ: HuskSync状態をログ
+            boolean huskSyncEnabledNowAdmin = (this.huskSyncHook != null && this.huskSyncHook.isEnabled());
+            boolean huskSyncPluginPresentAdmin = (getServer().getPluginManager().getPlugin("HuskSync") != null);
+            getLogger().info(String.format("[DEBUG] (admin) HuskSync present=%b, hookEnabled=%b", huskSyncPluginPresentAdmin, huskSyncEnabledNowAdmin));
+            
+            // HuskSyncでプレイヤーデータを保存してから転送（安全ラッパー）
+            saveWithHuskSyncOrRun(player, () -> {
+                // データ保存完了後にVelocityに転送リクエストを送信
+                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+                out.writeUTF("admin_gense_transfer");
+                out.writeUTF(player.getUniqueId().toString());
+                sendPluginMessage(out.toByteArray());
+                
+                getLogger().info("HuskSyncデータ保存完了後、管理者現世転送を実行: " + player.getName());
+            });
             return true;
         } else if (command.getName().equalsIgnoreCase("jigokutime")) {
             // 地獄の時間を表示
@@ -877,7 +944,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         ByteArrayDataOutput out = ByteStreams.newDataOutput();
         out.writeUTF("Connect");
         out.writeUTF(serverName);
-        player.sendPluginMessage(this, "BungeeCord", out.toByteArray());
+    player.sendPluginMessage(this, BUNGEECORD_CHANNEL, out.toByteArray());
     }
 
     @Override
@@ -898,7 +965,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     }
 
     private void sendHeartbeatResponse() {
-        World world = getServer().getWorlds().get(0);
+        World world = getMainWorld();
         if (world != null) {
             ByteArrayDataOutput out = ByteStreams.newDataOutput();
             out.writeUTF("heartbeat_response");
