@@ -17,7 +17,8 @@
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <velocity.api.version>3.3.0-SNAPSHOT</velocity.api.version>
-        <paper.api.version>1.20.4-R0.1-SNAPSHOT</paper.api.version>
+    <!-- Minecraft Paper 1.21.9 snapshot (ユーザー要望 1.21.9 対応) -->
+    <paper.api.version>1.21.9-R0.1-SNAPSHOT</paper.api.version>
     </properties>
 
     <modules>

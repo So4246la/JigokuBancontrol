@@ -3,6 +3,7 @@ package jp.example.jigokubancontrol;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.WorldBorder;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
@@ -50,6 +51,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private static final long NIGHT_END = 23000L;    // 24000L から 23000L に変更
     private static final int TIME_CHECK_INTERVAL = 100; // 5秒 (100 ticks)
     private static final long PENDING_MESSAGE_EXPIRE_TIME = 86400000L; // 24時間
+    private static final double WORLD_BORDER_MARGIN = 32.0; // ワールドボーダーからの安全マージン
     
     private final Set<UUID> deadPlayers = new HashSet<>();
     private final Set<UUID> joinedPlayers = new HashSet<>();
@@ -63,6 +65,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private Connection mysqlConnection;
     private boolean mysqlEnabled = false;
     private HuskSyncHook huskSyncHook;
+    private boolean spawnRangeWarningLogged = false;
 
     private boolean isNight(World world) {
         long time = world.getTime();
@@ -127,6 +130,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
         Bukkit.getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
         Bukkit.getMessenger().registerOutgoingPluginChannel(this, BUNGEECORD_CHANNEL);
         Bukkit.getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
+        // HuskSync の再初期化は行わない（Gense 側の実装に合わせて簡素化）
     }
 
     private void startDayNightMonitor() {
@@ -315,8 +319,36 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     // 死亡データの記録
     recordPlayerDeath(uuid);
     
-    // Velocityに死亡情報を送信
-    sendDeathNotification(player, event.getDeathMessage());
+    String deathMessage = null;
+    try {
+        // 1.21+: death message may be component-based; try adventure component via event.deathMessage() pattern
+        try {
+            // Reflective approach to avoid compile break if signature differs
+            java.lang.reflect.Method modern = event.getClass().getMethod("deathMessage");
+            Object comp = modern.invoke(event);
+            if (comp != null) {
+                deathMessage = comp.toString();
+            }
+        } catch (NoSuchMethodException ignored) {
+            // fallback
+        }
+        if (deathMessage == null) {
+            try {
+                java.lang.reflect.Method legacy = event.getClass().getMethod("getDeathMessage");
+                Object legacyStr = legacy.invoke(event);
+                if (legacyStr instanceof String) {
+                    deathMessage = (String) legacyStr;
+                }
+            } catch (NoSuchMethodException ignored) {
+            }
+        }
+    } catch (Exception reflectEx) {
+        getLogger().fine("死亡メッセージ取得で例外: " + reflectEx.getMessage());
+    }
+    if (deathMessage == null) {
+        deathMessage = player.getName() + " died.";
+    }
+    sendDeathNotification(player, deathMessage);
 }
 
     private void recordPlayerDeath(UUID uuid) {
@@ -381,8 +413,12 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         out.writeUTF("night_logout");
         out.writeUTF(playerUuid.toString());
         out.writeBoolean(false); // 死亡による転送ではない
-        
-        if (!sendPluginMessage(out.toByteArray())) {
+
+        byte[] payload = out.toByteArray();
+        boolean sent = sendPluginMessage(player, payload);
+        getLogger().info(String.format("夜間ログアウト通知送信: player=%s sent=%b", playerName, sent));
+
+        if (!sent) {
             // 送信できない場合は保留
             savePendingNightLogout(playerUuid, playerName);
         }
@@ -400,7 +436,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         dataConfig.set("pending-night-logout-time." + uuid.toString(), System.currentTimeMillis());
         dataConfig.set("pending-night-logout-name." + uuid.toString(), playerName);
         saveData();
-        getLogger().info("夜間ログアウト通知を保留しました: " + playerName);
+    getLogger().info("夜間ログアウト通知を保留しました: " + playerName);
     }
 
     @EventHandler
@@ -444,8 +480,9 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             out.writeUTF("night_logout");
             out.writeUTF(uuidString);
             out.writeBoolean(false);
-            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-            
+            boolean sent = sendPluginMessage(player, out.toByteArray());
+            getLogger().info(String.format("夜間ログアウト通知を再送: target=%s sent=%b", uuidString, sent));
+
             toRemove.add(uuidString);
             cleanupPendingData(uuidString);
         }
@@ -496,7 +533,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     }
 
     private void handleRegularJoin(Player player) {
-        player.sendMessage("§e再び地獄へようこそ！");
+        teleportToRandomLocation(player, "§e再び地獄へようこそ！");
         showTimeReminder(player);
     }
 
@@ -554,21 +591,71 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         return forceFindSafeLocation(world);
     }
 
+    private int[] pickRandomCoordinatesWithinBorder(World world) {
+        WorldBorder border = world.getWorldBorder();
+        Location center = border.getCenter();
+        double rawHalf = border.getSize() / 2.0;
+        double margin = Math.min(WORLD_BORDER_MARGIN, Math.max(2.0, rawHalf * 0.1));
+        margin = Math.min(margin, rawHalf - 1.0);
+        if (margin < 0) {
+            margin = 0;
+        }
+
+        double usableRadius = Math.max(1.0, rawHalf - margin);
+        double effectiveMax = (spawnRangeMax > 0) ? Math.min(spawnRangeMax, usableRadius) : usableRadius;
+        if (effectiveMax <= 0) {
+            effectiveMax = Math.max(1.0, usableRadius);
+        }
+
+        double effectiveMin = spawnRangeMin;
+        if (effectiveMin > effectiveMax) {
+            if (!spawnRangeWarningLogged) {
+                getLogger().warning(String.format(
+                    "spawn-range-min (%d) がワールドボーダー半径 %.1f を超えているため自動調整します。",
+                    spawnRangeMin, usableRadius));
+                spawnRangeWarningLogged = true;
+            }
+            effectiveMin = 0;
+        }
+        if (effectiveMin < 0) {
+            effectiveMin = 0;
+        }
+
+        double seaLevel = world.getSeaLevel();
+        for (int attempt = 0; attempt < 40; attempt++) {
+            double radius = (effectiveMax > effectiveMin)
+                ? effectiveMin + random.nextDouble() * (effectiveMax - effectiveMin)
+                : effectiveMax;
+            double angle = random.nextDouble() * Math.PI * 2;
+            double x = center.getX() + radius * Math.cos(angle);
+            double z = center.getZ() + radius * Math.sin(angle);
+            Location borderCheck = new Location(world, x + 0.5, seaLevel, z + 0.5);
+            if (!border.isInside(borderCheck)) {
+                continue;
+            }
+            return new int[]{(int) Math.round(x), (int) Math.round(z)};
+        }
+
+        // フォールバック: ボーダー中心付近
+        int fallbackX = (int) Math.round(center.getX());
+        int fallbackZ = (int) Math.round(center.getZ());
+        return new int[]{fallbackX, fallbackZ};
+    }
+
     private List<Location> findMultipleSafeLocations(World world, int count) {
         List<Location> locations = new ArrayList<>();
         int maxAttempts = 50; // 試行回数を制限
         
         for (int i = 0; i < maxAttempts && locations.size() < count; i++) {
-            int distance = spawnRangeMin + random.nextInt(spawnRangeMax - spawnRangeMin);
-            double angle = random.nextDouble() * 2 * Math.PI;
-            int x = (int)(distance * Math.cos(angle));
-            int z = (int)(distance * Math.sin(angle));
+            int[] coords = pickRandomCoordinatesWithinBorder(world);
+            int x = coords[0];
+            int z = coords[1];
             
             Location loc = world.getEnvironment() == World.Environment.NETHER
                 ? findSafeNetherLocation(world, x, z)
                 : findSafeNormalLocation(world, x, z);
                 
-            if (loc != null) {
+            if (loc != null && world.getWorldBorder().isInside(loc)) {
                 locations.add(loc);
             }
         }
@@ -589,7 +676,10 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             Material head = world.getBlockAt(x, y + 2, z).getType();
 
             if (isSolidGround(ground) && !isDangerousBlock(ground) && isSafeToStand(feet) && isSafeToStand(head) && isSurroundingSafe(world, x, y + 1, z)) {
-                return new Location(world, x + 0.5, y + 1, z + 0.5);
+                Location candidate = new Location(world, x + 0.5, y + 1, z + 0.5);
+                if (world.getWorldBorder().isInside(candidate)) {
+                    return candidate;
+                }
             }
             y++; // 少し上にずらして再試行
         }
@@ -606,7 +696,10 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             // 2ブロックの空間があり、足元が固体ブロックであること
             if (isSafeToStand(feetMaterial) && isSafeToStand(headMaterial) && isSolidGround(groundMaterial) && !isDangerousBlock(groundMaterial)) {
                  if (isSurroundingSafe(world, x, y, z)) {
-                    return new Location(world, x + 0.5, y, z + 0.5);
+                    Location candidate = new Location(world, x + 0.5, y, z + 0.5);
+                    if (world.getWorldBorder().isInside(candidate)) {
+                        return candidate;
+                    }
                 }
             }
         }
@@ -616,11 +709,11 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     private Location forceFindSafeLocation(World world) {
         // メソッド名を修正: forceFinSafeLocation -> forceFindSafeLocation
         // 最小範囲の近くで必ず見つける
+        WorldBorder border = world.getWorldBorder();
         for (int attempts = 0; attempts < 1000; attempts++) {
-            int distance = spawnRangeMin + random.nextInt(2000); // 最小距離+2000の範囲
-            double angle = random.nextDouble() * 2 * Math.PI;
-            int x = (int)(distance * Math.cos(angle));
-            int z = (int)(distance * Math.sin(angle));
+            int[] coords = pickRandomCoordinatesWithinBorder(world);
+            int x = coords[0];
+            int z = coords[1];
             
             // Y座標を強制的に安全な高さに設定
             int y;
@@ -637,18 +730,23 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             Material head = world.getBlockAt(x, y + 1, z).getType();
             
             if (feet.isAir() && head.isAir() && !below.isAir() && !isDangerousBlock(below)) {
+                Location candidate = new Location(world, x + 0.5, y, z + 0.5);
+                if (!border.isInside(candidate)) {
+                    continue;
+                }
                 getLogger().warning(String.format("強制的にスポーン地点を設定: x=%d, y=%d, z=%d", x, y, z));
-                return new Location(world, x + 0.5, y, z + 0.5);
+                return candidate;
             }
         }
         
         // 最終手段：原点から離れた固定位置
-        int emergencyX = spawnRangeMin;
-        int emergencyZ = spawnRangeMin;
-        int emergencyY = world.getEnvironment() == World.Environment.NETHER ? 70 : 100;
-        
-        getLogger().severe("安全なスポーン地点が見つからなかったため、緊急スポーン地点を使用します。");
-        return new Location(world, emergencyX, emergencyY, emergencyZ);
+        Location center = border.getCenter();
+        int centerX = (int) Math.round(center.getX());
+        int centerZ = (int) Math.round(center.getZ());
+        int emergencyY = world.getHighestBlockYAt(centerX, centerZ) + 1;
+        Location emergency = new Location(world, centerX + 0.5, emergencyY, centerZ + 0.5);
+        getLogger().severe("安全なスポーン地点が見つからなかったため、ワールドボーダー中心付近を使用します。");
+        return emergency;
     }
     
     // プレイヤーが立てる空間かチェック（改善版）
@@ -782,6 +880,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             }
 
             // 昼間の場合のみ転送処理を実行
+            getLogger().info("[TransferCommand] /gense invoked player=" + player.getName());
             getLogger().info("昼間と判定されたため、転送処理を開始します。");
             // 追加デバッグ: HuskSync状態をログ
             boolean huskSyncEnabledNow = (this.huskSyncHook != null && this.huskSyncHook.isEnabled());
@@ -793,13 +892,14 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             
             // HuskSyncでプレイヤーデータを保存してから転送（安全ラッパー）
             saveWithHuskSyncOrRun(player, () -> {
+                getLogger().info("[HuskSyncHook] 転送直前 (gense) callback開始 player=" + player.getName());
                 // データ保存完了後にVelocityに転送リクエストを送信
                 ByteArrayDataOutput out = ByteStreams.newDataOutput();
                 out.writeUTF("gense_transfer");
                 out.writeUTF(player.getUniqueId().toString());
                 player.sendPluginMessage(this, CHANNEL, out.toByteArray());
                 
-                getLogger().info("HuskSyncデータ保存完了後、現世転送を実行: " + player.getName());
+                getLogger().info("[HuskSyncHook] データ保存完了 -> 現世転送実行 player=" + player.getName());
             });
             
             return true;
@@ -812,6 +912,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             
             // 管理者用の現世転送
             player.sendMessage("§a[管理者] 現世への強制転送を開始します...");
+            getLogger().info("[TransferCommand] /admingense invoked player=" + player.getName());
             getLogger().info(String.format("[管理者転送] %s が現世への強制転送を実行しました。", player.getName()));
             // 追加デバッグ: HuskSync状態をログ
             boolean huskSyncEnabledNowAdmin = (this.huskSyncHook != null && this.huskSyncHook.isEnabled());
@@ -820,13 +921,14 @@ public void onPlayerDeath(PlayerDeathEvent event) {
             
             // HuskSyncでプレイヤーデータを保存してから転送（安全ラッパー）
             saveWithHuskSyncOrRun(player, () -> {
+                getLogger().info("[HuskSyncHook] 転送直前 (admin_gense) callback開始 player=" + player.getName());
                 // データ保存完了後にVelocityに転送リクエストを送信
                 ByteArrayDataOutput out = ByteStreams.newDataOutput();
                 out.writeUTF("admin_gense_transfer");
                 out.writeUTF(player.getUniqueId().toString());
                 sendPluginMessage(out.toByteArray());
                 
-                getLogger().info("HuskSyncデータ保存完了後、管理者現世転送を実行: " + player.getName());
+                getLogger().info("[HuskSyncHook] データ保存完了 -> 管理者現世転送実行 player=" + player.getName());
             });
             return true;
         } else if (command.getName().equalsIgnoreCase("jigokutime")) {
@@ -985,6 +1087,19 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     }
 
     private boolean sendPluginMessage(byte[] message) {
+        return sendPluginMessage(null, message);
+    }
+
+    private boolean sendPluginMessage(Player preferredSender, byte[] message) {
+        if (preferredSender != null) {
+            try {
+                preferredSender.sendPluginMessage(this, CHANNEL, message);
+                return true;
+            } catch (Exception ex) {
+                getLogger().fine("直接送信に失敗: " + preferredSender.getName() + " -> " + ex.getMessage());
+            }
+        }
+
         Collection<? extends Player> players = Bukkit.getOnlinePlayers();
         
         if (!players.isEmpty()) {

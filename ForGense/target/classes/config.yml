@@ -5,3 +5,6 @@ starting-lives: 3
 
 # 残機が1回復するまでの時間（分単位）
 revival-time-minutes: 60
+
+# Jigoku転送コマンドのクールダウン（秒）
+jigoku-transfer-cooldown-seconds: 300

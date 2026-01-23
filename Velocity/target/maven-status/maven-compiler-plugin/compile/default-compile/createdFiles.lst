@@ -2,7 +2,6 @@ jp\example\bancontrol\BanControlPlugin.class
 jp\example\bancontrol\BanInfo.class
 jp\example\bancontrol\BanControlPlugin$1.class
 jp\example\bancontrol\BanInfo$Reason.class
-jp\example\bancontrol\BanControlPlugin$GenseCommand.class
 jp\example\bancontrol\ConfigManager.class
 velocity-plugin.json
 jp\example\bancontrol\BanControlPlugin$2.class

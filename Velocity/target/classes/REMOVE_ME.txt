@@ -1,1 +1,0 @@
-This file exists to ensure the patch tool has write access. It can be deleted later.

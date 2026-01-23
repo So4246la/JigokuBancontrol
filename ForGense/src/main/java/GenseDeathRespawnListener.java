@@ -4,6 +4,8 @@ import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerGameModeChangeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -18,8 +20,11 @@ import com.google.common.io.ByteArrayDataOutput;
 import com.google.common.io.ByteStreams;
 
 import java.util.Collection;
+import java.util.Map;
 import java.util.UUID;
+import java.util.Set;
 import java.util.logging.Level;
+import java.util.concurrent.ConcurrentHashMap;
 
 import jp.example.gense.HuskSyncHook;
 
@@ -34,11 +39,26 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
     private static final String GAMEMODE_UPDATE_SUBCHANNEL = "gamemode_update";
     
     private HuskSyncHook huskSyncHook;
+    private final Map<UUID, Long> jigokuCooldownMap = new ConcurrentHashMap<>();
+    private long jigokuTransferCooldownMillis;
+    private final Set<UUID> pendingPseudoDeaths = ConcurrentHashMap.newKeySet();
 
     @Override
     public void onEnable() {
         // HuskSync統合を初期化
         this.huskSyncHook = new HuskSyncHook(this);
+        saveDefaultConfig();
+        reloadConfig();
+        long cooldownSeconds = getConfig().getLong("jigoku-transfer-cooldown-seconds", 300L);
+        if (cooldownSeconds < 0) {
+            cooldownSeconds = 0;
+        }
+        this.jigokuTransferCooldownMillis = cooldownSeconds * 1000L;
+        if (jigokuTransferCooldownMillis > 0) {
+            getLogger().info(String.format("Jigoku転送のクールダウンを %d 秒に設定しました。", cooldownSeconds));
+        } else {
+            getLogger().info("Jigoku転送のクールダウンは無効化されています。");
+        }
         
         registerChannels();
         getServer().getPluginManager().registerEvents(this, this);
@@ -147,7 +167,13 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
         Player player = (Player) sender;
 
         if (command.getName().equalsIgnoreCase("jigoku")) {
-            // ゲームモード制限を削除
+            if (isJigokuOnCooldown(player)) {
+                long remaining = getJigokuCooldownRemaining(player);
+                player.sendMessage(String.format("§c地獄への転送はクールダウン中です。残り: %s", formatDuration(remaining)));
+                getLogger().info(String.format("[TransferCommand] /jigoku cooldown active player=%s remaining=%dms", player.getName(), remaining));
+                return true;
+            }
+            getLogger().info("[TransferCommand] /jigoku invoked player=" + player.getName());
             requestJigokuTransfer(player);
             return true;
         } else if (command.getName().equalsIgnoreCase("adminjigoku")) {
@@ -158,10 +184,12 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
             }
             
             // 管理者用の地獄転送
+            getLogger().info("[TransferCommand] /adminjigoku invoked player=" + player.getName());
             requestAdminJigokuTransfer(player);
             return true;
         } else if (command.getName().equalsIgnoreCase("jigokutime")) {
             // Velocityに時刻情報をリクエスト
+            getLogger().info("[TransferCommand] /jigokutime invoked player=" + player.getName());
             requestJigokuTime(player);
             return true;
         }
@@ -179,6 +207,10 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
             out.writeUTF(JIGOKU_TRANSFER_SUBCHANNEL);
             out.writeUTF(player.getUniqueId().toString());
             player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+            applyJigokuCooldown(player);
+            if (jigokuTransferCooldownMillis > 0) {
+                player.sendMessage(String.format("§7次に地獄へ転送できるまで: %s", formatDuration(jigokuTransferCooldownMillis)));
+            }
             
             getLogger().info("HuskSyncデータ保存完了後、地獄転送を実行: " + player.getName());
         });
@@ -240,6 +272,40 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
         }
     }
 
+    private boolean isJigokuOnCooldown(Player player) {
+        if (jigokuTransferCooldownMillis <= 0) {
+            return false;
+        }
+        Long expiresAt = jigokuCooldownMap.get(player.getUniqueId());
+        return expiresAt != null && expiresAt > System.currentTimeMillis();
+    }
+
+    private long getJigokuCooldownRemaining(Player player) {
+        Long expiresAt = jigokuCooldownMap.get(player.getUniqueId());
+        if (expiresAt == null) {
+            return 0L;
+        }
+        long remaining = expiresAt - System.currentTimeMillis();
+        return Math.max(0L, remaining);
+    }
+
+    private void applyJigokuCooldown(Player player) {
+        if (jigokuTransferCooldownMillis <= 0) {
+            return;
+        }
+        jigokuCooldownMap.put(player.getUniqueId(), System.currentTimeMillis() + jigokuTransferCooldownMillis);
+    }
+
+    private String formatDuration(long millis) {
+        long totalSeconds = (millis + 999) / 1000;
+        long minutes = totalSeconds / 60;
+        long seconds = totalSeconds % 60;
+        if (minutes > 0) {
+            return String.format("%d分%d秒", minutes, seconds);
+        }
+        return String.format("%d秒", seconds);
+    }
+
     // プレイヤーを強制的に死亡させ、即座にリスポーンさせるメソッド
     private void triggerPseudoRespawn(Player player) {
         Bukkit.getScheduler().runTask(this, () -> {
@@ -247,6 +313,7 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
 
             // 死亡処理
             try {
+                pendingPseudoDeaths.add(player.getUniqueId());
                 player.setHealth(0.0);
             } catch (Exception e) {
                 getLogger().warning("プレイヤーの体力を0に設定できませんでした: " + e.getMessage());
@@ -263,7 +330,34 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
                     // フォールバック：手動でリスポーンイベントを発火
                     player.teleport(player.getWorld().getSpawnLocation());
                 }
+                schedulePostRespawnSnapshot(player);
             }, 1L);
         });
+    }
+
+    @EventHandler(priority = EventPriority.HIGHEST)
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        UUID uuid = event.getEntity().getUniqueId();
+        if (!pendingPseudoDeaths.remove(uuid)) {
+            return;
+        }
+
+        getLogger().fine("擬似死亡処理 (ドロップ・経験値は通常通り発生): " + event.getEntity().getName());
+    }
+
+    private void schedulePostRespawnSnapshot(Player player) {
+        if (huskSyncHook == null || !huskSyncHook.isEnabled()) {
+            return;
+        }
+
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!player.isOnline()) {
+                return;
+            }
+
+            huskSyncHook.savePlayerDataAndThen(player, () ->
+                getLogger().fine("HuskSyncスナップショットを死亡処理後に更新しました: " + player.getName())
+            );
+        }, 40L);
     }
 }

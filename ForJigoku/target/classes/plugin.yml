@@ -1,7 +1,7 @@
 name: JigokuBanControl
 main: jp.example.jigokubancontrol.JigokuBanControlPlugin
 version: 1.0
-api-version: 1.13
+api-version: 1.21
 softdepend:
   - HuskSync
 commands:
