@@ -39,8 +39,8 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.sql.*;
-
-import jp.example.jigokubancontrol.HuskSyncHook;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 public class JigokuBanControlPlugin extends JavaPlugin implements Listener, PluginMessageListener, CommandExecutor {
 
@@ -61,8 +61,9 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private final Random random = new Random();
     private int spawnRangeMin = 5000; // 最小スポーン距離
     private int spawnRangeMax = 20000; // 最大スポーン距離
+    private boolean regularJoinTeleport = true; // 通常参加時のランダムテレポート有効/無効
     private boolean wasNight = false; // 最後にチェックした時の夜かどうかを保持
-    private Connection mysqlConnection;
+    private HikariDataSource dataSource;
     private boolean mysqlEnabled = false;
     private HuskSyncHook huskSyncHook;
     private boolean spawnRangeWarningLogged = false;
@@ -117,6 +118,7 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
         FileConfiguration config = getConfig();
         spawnRangeMin = config.getInt("spawn-range-min", 5000);
         spawnRangeMax = config.getInt("spawn-range-max", 20000);
+        regularJoinTeleport = config.getBoolean("regular-join-teleport", true);
         
         // 設定値の検証
         if (spawnRangeMin < 0 || spawnRangeMax < spawnRangeMin) {
@@ -204,22 +206,36 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
             String password = config.getString("mysql.password", "password");
 
             try {
-                String url = String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC", host, port, database);
-                mysqlConnection = DriverManager.getConnection(url, username, password);
+                HikariConfig hikariConfig = new HikariConfig();
+                hikariConfig.setJdbcUrl(String.format("jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC", host, port, database));
+                hikariConfig.setUsername(username);
+                hikariConfig.setPassword(password);
+                
+                // HikariCP設定（config.ymlから読み込み）
+                hikariConfig.setMaximumPoolSize(config.getInt("mysql.maximum_pool_size", 10));
+                hikariConfig.setMinimumIdle(config.getInt("mysql.minimum_idle", 2));
+                hikariConfig.setConnectionTimeout(config.getLong("mysql.connection_timeout", 30000L));
+                hikariConfig.setIdleTimeout(config.getLong("mysql.idle_timeout", 600000L));
+                hikariConfig.setMaxLifetime(config.getLong("mysql.max_lifetime", 1800000L));
+                hikariConfig.setConnectionTestQuery("SELECT 1");
+                hikariConfig.setPoolName("JigokuBanControl-MySQL-Pool");
+                
+                dataSource = new HikariDataSource(hikariConfig);
                 mysqlEnabled = true;
 
                 // テーブルを作成
                 createWorldTimeTable();
-                getLogger().info("MySQL接続に成功しました。");
-            } catch (SQLException e) {
-                getLogger().log(Level.SEVERE, "MySQL接続に失敗しました。", e);
+                getLogger().info("MySQL接続プール(HikariCP)を初期化しました。");
+            } catch (Exception e) {
+                getLogger().log(Level.SEVERE, "MySQL接続プールの初期化に失敗しました。", e);
                 mysqlEnabled = false;
             }
         }
     }
 
     private void createWorldTimeTable() {
-        try (Statement stmt = mysqlConnection.createStatement()) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
             stmt.execute(
                 "CREATE TABLE IF NOT EXISTS world_times (" +
                 "world_name VARCHAR(64) PRIMARY KEY," +
@@ -236,29 +252,26 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
     private void updateWorldTime(String worldName, long time, boolean isNight) {
         if (!mysqlEnabled) return;
         
-        try {
+        try (Connection conn = dataSource.getConnection()) {
             String query = "INSERT INTO world_times (world_name, time, is_night) VALUES (?, ?, ?) " +
                           "ON DUPLICATE KEY UPDATE time = VALUES(time), is_night = VALUES(is_night)";
-            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+            try (PreparedStatement stmt = conn.prepareStatement(query)) {
                 stmt.setString(1, "jigoku"); // 常に"jigoku"として保存
                 stmt.setLong(2, time);
                 stmt.setBoolean(3, isNight);
                 stmt.executeUpdate();
             }
         } catch (SQLException e) {
-            getLogger().log(Level.WARNING, "MySQLへの時刻情報の更新に失敗しました。", e);
+            getLogger().log(Level.WARNING, "MySQLへの時刻情報の更新に失敗しました。HikariCPが自動的に再接続を試みます。", e);
         }
     }
 
     @Override
     public void onDisable() {
         saveData();
-        if (mysqlConnection != null) {
-            try {
-                mysqlConnection.close();
-            } catch (SQLException e) {
-                getLogger().log(Level.WARNING, "MySQL接続のクローズに失敗しました。", e);
-            }
+        if (dataSource != null && !dataSource.isClosed()) {
+            dataSource.close();
+            getLogger().info("MySQL接続プール(HikariCP)を正常にクローズしました");
         }
     }
 
@@ -311,45 +324,52 @@ public class JigokuBanControlPlugin extends JavaPlugin implements Listener, Plug
         }
     }
 
-@EventHandler
-public void onPlayerDeath(PlayerDeathEvent event) {
-    Player player = event.getEntity();
-    UUID uuid = player.getUniqueId();
-    
-    // 死亡データの記録
-    recordPlayerDeath(uuid);
-    
-    String deathMessage = null;
-    try {
-        // 1.21+: death message may be component-based; try adventure component via event.deathMessage() pattern
+    @EventHandler
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        Player player = event.getEntity();
+        UUID uuid = player.getUniqueId();
+
+        // 死亡データの記録
+        recordPlayerDeath(uuid);
+
+        String deathMessage = null;
         try {
-            // Reflective approach to avoid compile break if signature differs
-            java.lang.reflect.Method modern = event.getClass().getMethod("deathMessage");
-            Object comp = modern.invoke(event);
-            if (comp != null) {
-                deathMessage = comp.toString();
-            }
-        } catch (NoSuchMethodException ignored) {
-            // fallback
-        }
-        if (deathMessage == null) {
+            // 1.21+: death message may be component-based; try adventure component via
+            // event.deathMessage() pattern
             try {
-                java.lang.reflect.Method legacy = event.getClass().getMethod("getDeathMessage");
-                Object legacyStr = legacy.invoke(event);
-                if (legacyStr instanceof String) {
-                    deathMessage = (String) legacyStr;
+                // Reflective approach to avoid compile break if signature differs
+                java.lang.reflect.Method modern = event.getClass().getMethod("deathMessage");
+                Object comp = modern.invoke(event);
+                if (comp != null) {
+                    deathMessage = comp.toString();
                 }
             } catch (NoSuchMethodException ignored) {
+                // fallback
             }
+            if (deathMessage == null) {
+                try {
+                    java.lang.reflect.Method legacy = event.getClass().getMethod("getDeathMessage");
+                    Object legacyStr = legacy.invoke(event);
+                    if (legacyStr instanceof String) {
+                        deathMessage = (String) legacyStr;
+                    }
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+        } catch (Exception reflectEx) {
+            getLogger().fine("死亡メッセージ取得で例外: " + reflectEx.getMessage());
         }
-    } catch (Exception reflectEx) {
-        getLogger().fine("死亡メッセージ取得で例外: " + reflectEx.getMessage());
+        if (deathMessage == null) {
+            deathMessage = player.getName() + " died.";
+        }
+        
+        // HuskSyncでプレイヤーデータを保存してから死亡通知を送信
+        final String finalDeathMessage = deathMessage;
+        saveWithHuskSyncOrRun(player, () -> {
+            getLogger().info("[Death] HuskSyncデータ保存完了後、死亡通知を送信: " + player.getName());
+            sendDeathNotification(player, finalDeathMessage);
+        });
     }
-    if (deathMessage == null) {
-        deathMessage = player.getName() + " died.";
-    }
-    sendDeathNotification(player, deathMessage);
-}
 
     private void recordPlayerDeath(UUID uuid) {
         deadPlayers.add(uuid);
@@ -384,16 +404,16 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     public void onPlayerQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
         UUID playerUuid = player.getUniqueId();
-        
+
         // 死亡による退出の場合はスキップ
         if (recentlyDiedPlayers.contains(playerUuid)) {
             getLogger().info("死亡による転送のため夜間ログアウトペナルティをスキップ: " + player.getName());
             recentlyDiedPlayers.remove(playerUuid);
             return;
         }
-        
-    // 夜間ログアウトの処理（メインワールド基準）
-    if (isNight(getWorldForNightCheck(player))) {
+
+        // 夜間ログアウトの処理（メインワールド基準）
+        if (isNight(getWorldForNightCheck(player))) {
             handleNightLogout(player);
         }
     }
@@ -533,7 +553,11 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     }
 
     private void handleRegularJoin(Player player) {
-        teleportToRandomLocation(player, "§e再び地獄へようこそ！");
+        if (regularJoinTeleport) {
+            teleportToRandomLocation(player, "§e再び地獄へようこそ！");
+        } else {
+            player.sendMessage("§e再び地獄へようこそ！");
+        }
         showTimeReminder(player);
     }
 
@@ -956,7 +980,7 @@ public void onPlayerDeath(PlayerDeathEvent event) {
     }
 
     private void getJigokuTimeFromMySQL(Player player) {
-        if (!mysqlEnabled || mysqlConnection == null) {
+        if (!mysqlEnabled || dataSource == null) {
             player.sendMessage("§cMySQL接続が利用できません。");
             return;
         }
@@ -964,7 +988,8 @@ public void onPlayerDeath(PlayerDeathEvent event) {
         // 非同期でMySQLから時刻を取得
         Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
             String query = "SELECT time, is_night, last_update FROM world_times WHERE world_name = ?";
-            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
                 stmt.setString(1, "jigoku");
                 try (ResultSet rs = stmt.executeQuery()) {
                     if (rs.next()) {

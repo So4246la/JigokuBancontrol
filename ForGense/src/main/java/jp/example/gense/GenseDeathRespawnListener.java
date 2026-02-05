@@ -26,8 +26,6 @@ import java.util.Set;
 import java.util.logging.Level;
 import java.util.concurrent.ConcurrentHashMap;
 
-import jp.example.gense.HuskSyncHook;
-
 public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessageListener, Listener, CommandExecutor {
 
     private static final String CHANNEL = "myserver:bancontrol";

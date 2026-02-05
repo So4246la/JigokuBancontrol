@@ -3,11 +3,12 @@
   <parent>
     <artifactId>jigokubancontrol-parent</artifactId>
     <groupId>jp.example</groupId>
-    <version>1.0</version>
+    <version>1.1</version>
   </parent>
   <modelVersion>4.0.0</modelVersion>
   <artifactId>bancontrol</artifactId>
   <name>BanControl</name>
+  <version>1.1</version>
   <description>Velocity BanControl Plugin</description>
   <build>
     <plugins>
@@ -25,13 +26,21 @@
       </plugin>
       <plugin>
         <artifactId>maven-shade-plugin</artifactId>
-        <version>3.5.1</version>
+        <version>3.6.0</version>
         <executions>
           <execution>
             <phase>package</phase>
             <goals>
               <goal>shade</goal>
             </goals>
+            <configuration>
+              <relocations>
+                <relocation>
+                  <pattern>com.zaxxer.hikari</pattern>
+                  <shadedPattern>jp.example.bancontrol.libs.hikari</shadedPattern>
+                </relocation>
+              </relocations>
+            </configuration>
           </execution>
         </executions>
       </plugin>

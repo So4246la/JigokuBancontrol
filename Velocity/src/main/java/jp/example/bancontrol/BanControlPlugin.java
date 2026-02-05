@@ -19,6 +19,8 @@ import com.velocitypowered.api.plugin.annotation.DataDirectory;
 // 同一パッケージ内のため import は不要
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 import javax.inject.Inject;
 import java.io.*;
@@ -52,8 +54,9 @@ public class BanControlPlugin {
     private final Map<String, Long> worldTimes = new ConcurrentHashMap<>();
     // 未使用の保留クエリは削除
     private ScheduledFuture<?> heartbeatTask; // 追加
-    private Connection mysqlConnection;
+    private HikariDataSource dataSource;
     private boolean mysqlEnabled = false;
+    private boolean debugMode = false;
 
     @Inject
     public BanControlPlugin(ProxyServer server, @DataDirectory Path dataDirectory, Logger logger) {
@@ -67,6 +70,8 @@ public class BanControlPlugin {
         try {
             // ConfigManagerを初期化
             this.configManager = new ConfigManager(dataDirectory, logger);
+            this.debugMode = configManager.getBoolean("debug", false);
+            logger.info("デバッグモード: {}", debugMode ? "有効" : "無効");
 
             // MySQL接続を初期化
             initializeMySQL();
@@ -145,24 +150,35 @@ public class BanControlPlugin {
         String password = config.getString("password", "password");
 
         try {
-            String url = String.format(
-                "jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&autoReconnect=true&allowPublicKeyRetrieval=true",
-                host, port, database
-            );
-            mysqlConnection = DriverManager.getConnection(url, username, password);
+            HikariConfig hikariConfig = new HikariConfig();
+            hikariConfig.setJdbcUrl(String.format(
+                    "jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true",
+                    host, port, database));
+            hikariConfig.setUsername(username);
+            hikariConfig.setPassword(password);
+
+            // HikariCP設定（config.tomlから読み込み）
+            hikariConfig.setMaximumPoolSize(config.getLong("maximum_pool_size", 10L).intValue());
+            hikariConfig.setMinimumIdle(config.getLong("minimum_idle", 2L).intValue());
+            hikariConfig.setConnectionTimeout(config.getLong("connection_timeout", 30000L));
+            hikariConfig.setIdleTimeout(config.getLong("idle_timeout", 600000L));
+            hikariConfig.setMaxLifetime(config.getLong("max_lifetime", 1800000L));
+
+            dataSource = new HikariDataSource(hikariConfig);
             mysqlEnabled = true;
 
             // テーブルを作成
             createWorldTimeTable();
-            logger.info("MySQL接続に成功しました。");
-        } catch (SQLException e) {
-            logger.error("MySQL接続に失敗しました。", e);
+            logger.info("MySQL接続プール(HikariCP)を初期化しました。");
+        } catch (Exception e) {
+            logger.error("MySQL接続プールの初期化に失敗しました。", e);
             mysqlEnabled = false;
         }
     }
 
     private void createWorldTimeTable() {
-        try (Statement stmt = mysqlConnection.createStatement()) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
             stmt.execute(
                 "CREATE TABLE IF NOT EXISTS world_times (" +
                 "world_name VARCHAR(64) PRIMARY KEY," +
@@ -187,39 +203,28 @@ public class BanControlPlugin {
     }
 
     private void updateWorldTimeFromMySQL() {
-        if (!mysqlEnabled || mysqlConnection == null) return;
+        if (!mysqlEnabled || dataSource == null) return;
         
         String query = "SELECT world_name, time, is_night FROM world_times WHERE world_name = ?";
-        try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
             stmt.setString(1, "jigoku");
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
                     long time = rs.getLong("time");
                     updateWorldTime("jigoku", time);
-            logger.debug("[MySQLHeartbeat] row found time={} (mysqlEnabled={})", time, mysqlEnabled);
+                    if (debugMode) logger.info("[DEBUG][MySQLHeartbeat] row found time={} (mysqlEnabled={})", time, mysqlEnabled);
                 } else {
                     // DBに行が無い場合は、ハートビートで最新値の取得を試みる
-            logger.debug("[MySQLHeartbeat] row missing -> request heartbeat (mysqlEnabled={})", mysqlEnabled);
+                    if (debugMode) logger.info("[DEBUG][MySQLHeartbeat] row missing -> request heartbeat (mysqlEnabled={})", mysqlEnabled);
                     sendHeartbeatToJigoku();
                 }
             }
         } catch (SQLException e) {
-            logger.error("MySQLから時刻情報の取得に失敗しました。", e);
-            checkMySQLConnection();
+            logger.error("MySQLから時刻情報の取得に失敗しました。HikariCPが自動的に再接続を試みます。", e);
             // DBエラー時もハートビートでの取得を試みる
-        logger.debug("[MySQLHeartbeat] exception -> heartbeat fallback");
+            if (debugMode) logger.info("[DEBUG][MySQLHeartbeat] exception -> heartbeat fallback");
             sendHeartbeatToJigoku();
-        }
-    }
-
-    private void checkMySQLConnection() {
-        try {
-            if (mysqlConnection == null || mysqlConnection.isClosed()) {
-                logger.info("MySQL接続が切断されました。再接続を試みます。");
-                initializeMySQL();
-            }
-        } catch (SQLException e) {
-            logger.error("MySQL接続の確認に失敗しました。", e);
         }
     }
 
@@ -359,11 +364,11 @@ public class BanControlPlugin {
             // 時刻チェック
             if (isJigokuNight()) {
                 player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
-                logger.debug("[Transfer] jigoku_transfer blocked by night uuid={}", uuid);
+                if (debugMode) logger.info("[DEBUG][Transfer] jigoku_transfer blocked by night uuid={}", uuid);
                 return;
             }
 
-            logger.debug("[Transfer] jigoku_transfer allowed uuid={}", uuid);
+            if (debugMode) logger.info("[DEBUG][Transfer] jigoku_transfer allowed uuid={}", uuid);
             transferToServer(player, getJigokuServerName());
         });
     }
@@ -372,7 +377,7 @@ public class BanControlPlugin {
         UUID uuid = UUID.fromString(in.readUTF());
         server.getPlayer(uuid).ifPresent(player -> {
             // GenseへはBAN解除後に戻れる想定ならBANチェックを外す（必要なら再度有効化）
-            logger.debug("[Transfer] gense_transfer processing uuid={} (no ban gate)", uuid);
+            if (debugMode) logger.info("[DEBUG][Transfer] gense_transfer processing uuid={} (no ban gate)", uuid);
             transferToServer(player, getGenseServerName());
         });
     }
@@ -435,8 +440,8 @@ public class BanControlPlugin {
         UUID uuid = UUID.fromString(in.readUTF());
     String deathMessage = in.readUTF();
         boolean isDeathTransfer = in.readBoolean();
-    // 参考ログ（内容確認用）
-    logger.debug("death_notification: message='{}' isDeathTransfer={}", deathMessage, isDeathTransfer);
+        // 参考ログ（内容確認用）
+        if (debugMode) logger.info("[DEBUG] death_notification: message='{}' isDeathTransfer={}", deathMessage, isDeathTransfer);
         // 死亡フラグのみセット（BANは適用しない）
         deathFlagSet.add(uuid);
         
@@ -551,7 +556,7 @@ public class BanControlPlugin {
     private void handleHeartbeatResponse(ByteArrayDataInput in) {
     String state = in.readUTF();
         long time = in.readLong();
-    logger.debug("heartbeat_response: state='{}' time={}", state, time);
+        if (debugMode) logger.info("[DEBUG] heartbeat_response: state='{}' time={}", state, time);
         updateWorldTime("jigoku", time);
     }
 
@@ -559,20 +564,21 @@ public class BanControlPlugin {
         boolean result;
         if (mysqlEnabled) {
             result = checkJigokuNightFromMySQL();
-            logger.debug("[NightCheck] via MySQL -> {}", result);
+            if (debugMode) logger.info("[DEBUG][NightCheck] via MySQL -> {}", result);
         } else {
             Long time = worldTimes.get("jigoku");
             result = time != null && isNightTime(time);
-            logger.debug("[NightCheck] via cache time={} -> {}", time, result);
+            if (debugMode) logger.info("[DEBUG][NightCheck] via cache time={} -> {}", time, result);
         }
         return result;
     }
 
     private boolean checkJigokuNightFromMySQL() {
-        if (mysqlConnection == null) return false;
+        if (!mysqlEnabled || dataSource == null) return false;
         
         String query = "SELECT is_night FROM world_times WHERE world_name = ?";
-        try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
             stmt.setString(1, "jigoku");
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
@@ -664,7 +670,7 @@ public class BanControlPlugin {
 
     private synchronized void saveBans() {
         if (banMap.isEmpty()) {
-            logger.debug("BANデータが空のため、保存をスキップします");
+            if (debugMode) logger.info("[DEBUG] BANデータが空のため、保存をスキップします");
             return;
         }
         
@@ -672,7 +678,7 @@ public class BanControlPlugin {
             Map<String, BanInfo> toSave = new HashMap<>();
             banMap.forEach((k, v) -> toSave.put(k.toString(), v));
             mapper.writerWithDefaultPrettyPrinter().writeValue(banFile, toSave);
-            logger.debug("{}件のBANデータを保存しました", toSave.size());
+            if (debugMode) logger.info("[DEBUG] {}件のBANデータを保存しました", toSave.size());
         } catch (Exception e) {
             logger.error("bans.jsonへのBAN保存に失敗しました", e);
         }
@@ -768,22 +774,16 @@ public class BanControlPlugin {
     }
 
     private void closeMySQLConnection() {
-        if (mysqlConnection != null) {
-            try {
-                if (!mysqlConnection.isClosed()) {
-                    mysqlConnection.close();
-                    logger.info("MySQL接続を正常にクローズしました");
-                }
-            } catch (SQLException e) {
-                logger.error("MySQL接続のクローズに失敗しました", e);
-            }
+        if (dataSource != null && !dataSource.isClosed()) {
+            dataSource.close();
+            logger.info("MySQL接続プール(HikariCP)を正常にクローズしました");
         }
     }
 
     private void handleJigokuTimeQuery(ByteArrayDataInput in, PluginMessageEvent event) {
         UUID uuid = UUID.fromString(in.readUTF());
         server.getPlayer(uuid).ifPresent(player -> {
-        logger.debug("[TimeQuery] start mysqlEnabled={} connNull={} connClosed={} uuid={}", mysqlEnabled, (mysqlConnection==null), safeIsClosed(), uuid);
+            if (debugMode) logger.info("[DEBUG][TimeQuery] start mysqlEnabled={} dataSourceNull={} uuid={}", mysqlEnabled, (dataSource==null), uuid);
             if (mysqlEnabled) {
                 // MySQLから時刻情報を取得して返す
                 queryJigokuTimeFromMySQL(player);
@@ -791,11 +791,11 @@ public class BanControlPlugin {
                 // 推定時刻を返す
                 Long time = worldTimes.get("jigoku");
                 if (time != null) {
-            logger.debug("[TimeQuery] cache-hit time={}", time);
+                    if (debugMode) logger.info("[DEBUG][TimeQuery] cache-hit time={}", time);
                     sendJigokuTimeResponse(player, time, isNightTime(time));
                 } else {
                     // まだキャッシュが無ければ、ハートビートを送って取得を試みる
-            logger.debug("[TimeQuery] cache-miss -> heartbeat");
+                    if (debugMode) logger.info("[DEBUG][TimeQuery] cache-miss -> heartbeat");
                     sendHeartbeatToJigoku();
                     player.sendMessage(Component.text("§e地獄ワールドの時刻を取得中です。数秒後に/jigokutime をもう一度実行してください。"));
                 }
@@ -804,15 +804,16 @@ public class BanControlPlugin {
     }
 
     private void queryJigokuTimeFromMySQL(Player player) {
-        if (!mysqlEnabled || mysqlConnection == null) {
+        if (!mysqlEnabled || dataSource == null) {
             player.sendMessage(Component.text("§cMySQL接続が利用できません。"));
-            logger.debug("[TimeQuery/MySQL] rejected mysqlEnabled={} connNull={}", mysqlEnabled, (mysqlConnection==null));
+            if (debugMode) logger.info("[DEBUG][TimeQuery/MySQL] rejected mysqlEnabled={} dataSourceNull={}", mysqlEnabled, (dataSource==null));
             return;
         }
         
         scheduler.execute(() -> {
             String query = "SELECT time, is_night, last_update FROM world_times WHERE world_name = ?";
-            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
                 stmt.setString(1, "jigoku");
                 logger.debug("[TimeQuery/MySQL] executing query uuid={} thread={}", player.getUniqueId(), Thread.currentThread().getName());
                 try (ResultSet rs = stmt.executeQuery()) {
@@ -850,17 +851,6 @@ public class BanControlPlugin {
                 }
             }
         });
-    }
-
-    // コネクションのisClosed呼び出しで例外を潰して安全に状態を返す
-    private Object safeIsClosed() {
-        if (mysqlConnection == null) return null;
-        try {
-            return mysqlConnection.isClosed();
-        } catch (SQLException e) {
-            logger.debug("[Debug] safeIsClosed exception", e);
-            return "err";
-        }
     }
 
     private void sendJigokuTimeResponse(Player player, long time, boolean isNight) {
