@@ -24,3 +24,9 @@ port = 3306
 database = "jigoku_bancontrol"
 username = "root"
 password = "password"
+# HikariCP コネクションプール設定
+maximum_pool_size = 10       # 最大接続数
+minimum_idle = 2              # 最小アイドル接続数
+connection_timeout = 30000    # 接続タイムアウト (ミリ秒)
+idle_timeout = 600000         # アイドルタイムアウト (ミリ秒, 10分)
+max_lifetime = 1800000        # 最大生存時間 (ミリ秒, 30分)

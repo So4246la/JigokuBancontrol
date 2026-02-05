@@ -6,19 +6,19 @@
 
     <groupId>jp.example</groupId>
     <artifactId>jigokubancontrol-parent</artifactId>
-    <version>1.0</version>
+    <version>1.1</version>
     <packaging>pom</packaging>
 
     <name>JigokuBanControl Parent</name>
     <description>Parent POM for JigokuBanControl multi-module project</description>
 
     <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <velocity.api.version>3.3.0-SNAPSHOT</velocity.api.version>
-    <!-- Minecraft Paper 1.21.9 snapshot (ユーザー要望 1.21.9 対応) -->
-    <paper.api.version>1.21.9-R0.1-SNAPSHOT</paper.api.version>
+        <!-- Minecraft Paper 1.21.11 (Updated for latest version) -->
+        <paper.api.version>1.21.11-R0.1-SNAPSHOT</paper.api.version>
     </properties>
 
     <modules>
@@ -58,6 +58,12 @@
                 <groupId>mysql</groupId>
                 <artifactId>mysql-connector-java</artifactId>
                 <version>8.0.33</version>
+            </dependency>
+            <!-- HikariCP Connection Pool -->
+            <dependency>
+                <groupId>com.zaxxer</groupId>
+                <artifactId>HikariCP</artifactId>
+                <version>5.1.0</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

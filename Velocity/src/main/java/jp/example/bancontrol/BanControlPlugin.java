@@ -19,6 +19,8 @@ import com.velocitypowered.api.plugin.annotation.DataDirectory;
 // 同一パッケージ内のため import は不要
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
 
 import javax.inject.Inject;
 import java.io.*;
@@ -52,7 +54,7 @@ public class BanControlPlugin {
     private final Map<String, Long> worldTimes = new ConcurrentHashMap<>();
     // 未使用の保留クエリは削除
     private ScheduledFuture<?> heartbeatTask; // 追加
-    private Connection mysqlConnection;
+    private HikariDataSource dataSource;
     private boolean mysqlEnabled = false;
 
     @Inject
@@ -145,24 +147,29 @@ public class BanControlPlugin {
         String password = config.getString("password", "password");
 
         try {
-            String url = String.format(
-                "jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&autoReconnect=true&allowPublicKeyRetrieval=true",
+            HikariConfig hikariConfig = new HikariConfig();
+            hikariConfig.setJdbcUrl(String.format(
+                "jdbc:mysql://%s:%d/%s?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true",
                 host, port, database
-            );
-            mysqlConnection = DriverManager.getConnection(url, username, password);
-            mysqlEnabled = true;
-
-            // テーブルを作成
-            createWorldTimeTable();
-            logger.info("MySQL接続に成功しました。");
-        } catch (SQLException e) {
-            logger.error("MySQL接続に失敗しました。", e);
+            ));
+            hikariConfig.setUsername(username);
+            hikariConfig.setPassword(password);
+            
+                // HikariCP設定（config.tomlから読み込み）
+                hikariConfig.setMaximumPoolSize(config.getLong("maximum_pool_size", 10L).intValue());
+                hikariConfig.setMinimumIdle(config.getLong("minimum_idle", 2L).intValue());
+                hikariConfig.setConnectionTimeout(config.getLong("connection_timeout", 30000L));
+                hikariConfig.setIdleTimeout(config.getLong("idle_timeout", 600000L));
+                hikariConfig.setMaxLifetime(config.getLong("max_lifetime", 1800000L));
+        } catch (Exception e) {
+            logger.error("MySQL接続プールの初期化に失敗しました。", e);
             mysqlEnabled = false;
         }
     }
 
     private void createWorldTimeTable() {
-        try (Statement stmt = mysqlConnection.createStatement()) {
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
             stmt.execute(
                 "CREATE TABLE IF NOT EXISTS world_times (" +
                 "world_name VARCHAR(64) PRIMARY KEY," +
@@ -187,10 +194,11 @@ public class BanControlPlugin {
     }
 
     private void updateWorldTimeFromMySQL() {
-        if (!mysqlEnabled || mysqlConnection == null) return;
+        if (!mysqlEnabled || dataSource == null) return;
         
         String query = "SELECT world_name, time, is_night FROM world_times WHERE world_name = ?";
-        try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
             stmt.setString(1, "jigoku");
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
@@ -204,22 +212,10 @@ public class BanControlPlugin {
                 }
             }
         } catch (SQLException e) {
-            logger.error("MySQLから時刻情報の取得に失敗しました。", e);
-            checkMySQLConnection();
+            logger.error("MySQLから時刻情報の取得に失敗しました。HikariCPが自動的に再接続を試みます。", e);
             // DBエラー時もハートビートでの取得を試みる
         logger.debug("[MySQLHeartbeat] exception -> heartbeat fallback");
             sendHeartbeatToJigoku();
-        }
-    }
-
-    private void checkMySQLConnection() {
-        try {
-            if (mysqlConnection == null || mysqlConnection.isClosed()) {
-                logger.info("MySQL接続が切断されました。再接続を試みます。");
-                initializeMySQL();
-            }
-        } catch (SQLException e) {
-            logger.error("MySQL接続の確認に失敗しました。", e);
         }
     }
 
@@ -569,10 +565,11 @@ public class BanControlPlugin {
     }
 
     private boolean checkJigokuNightFromMySQL() {
-        if (mysqlConnection == null) return false;
+        if (!mysqlEnabled || dataSource == null) return false;
         
         String query = "SELECT is_night FROM world_times WHERE world_name = ?";
-        try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement stmt = conn.prepareStatement(query)) {
             stmt.setString(1, "jigoku");
             try (ResultSet rs = stmt.executeQuery()) {
                 if (rs.next()) {
@@ -768,22 +765,16 @@ public class BanControlPlugin {
     }
 
     private void closeMySQLConnection() {
-        if (mysqlConnection != null) {
-            try {
-                if (!mysqlConnection.isClosed()) {
-                    mysqlConnection.close();
-                    logger.info("MySQL接続を正常にクローズしました");
-                }
-            } catch (SQLException e) {
-                logger.error("MySQL接続のクローズに失敗しました", e);
-            }
+        if (dataSource != null && !dataSource.isClosed()) {
+            dataSource.close();
+            logger.info("MySQL接続プール(HikariCP)を正常にクローズしました");
         }
     }
 
     private void handleJigokuTimeQuery(ByteArrayDataInput in, PluginMessageEvent event) {
         UUID uuid = UUID.fromString(in.readUTF());
         server.getPlayer(uuid).ifPresent(player -> {
-        logger.debug("[TimeQuery] start mysqlEnabled={} connNull={} connClosed={} uuid={}", mysqlEnabled, (mysqlConnection==null), safeIsClosed(), uuid);
+        logger.debug("[TimeQuery] start mysqlEnabled={} dataSourceNull={} uuid={}", mysqlEnabled, (dataSource==null), uuid);
             if (mysqlEnabled) {
                 // MySQLから時刻情報を取得して返す
                 queryJigokuTimeFromMySQL(player);
@@ -804,15 +795,16 @@ public class BanControlPlugin {
     }
 
     private void queryJigokuTimeFromMySQL(Player player) {
-        if (!mysqlEnabled || mysqlConnection == null) {
+        if (!mysqlEnabled || dataSource == null) {
             player.sendMessage(Component.text("§cMySQL接続が利用できません。"));
-            logger.debug("[TimeQuery/MySQL] rejected mysqlEnabled={} connNull={}", mysqlEnabled, (mysqlConnection==null));
+            logger.debug("[TimeQuery/MySQL] rejected mysqlEnabled={} dataSourceNull={}", mysqlEnabled, (dataSource==null));
             return;
         }
         
         scheduler.execute(() -> {
             String query = "SELECT time, is_night, last_update FROM world_times WHERE world_name = ?";
-            try (PreparedStatement stmt = mysqlConnection.prepareStatement(query)) {
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement stmt = conn.prepareStatement(query)) {
                 stmt.setString(1, "jigoku");
                 logger.debug("[TimeQuery/MySQL] executing query uuid={} thread={}", player.getUniqueId(), Thread.currentThread().getName());
                 try (ResultSet rs = stmt.executeQuery()) {
@@ -850,17 +842,6 @@ public class BanControlPlugin {
                 }
             }
         });
-    }
-
-    // コネクションのisClosed呼び出しで例外を潰して安全に状態を返す
-    private Object safeIsClosed() {
-        if (mysqlConnection == null) return null;
-        try {
-            return mysqlConnection.isClosed();
-        } catch (SQLException e) {
-            logger.debug("[Debug] safeIsClosed exception", e);
-            return "err";
-        }
     }
 
     private void sendJigokuTimeResponse(Player player, long time, boolean isNight) {
