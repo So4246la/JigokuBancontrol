@@ -1,3 +1,6 @@
+# デバッグモード（trueにすると詳細ログを出力）
+debug = false
+
 # サーバー名
 jigoku_server_name = "jigoku"
 gense_server_name = "gense"

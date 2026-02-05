@@ -8,3 +8,6 @@ revival-time-minutes: 60
 
 # Jigoku転送コマンドのクールダウン（秒）
 jigoku-transfer-cooldown-seconds: 300
+
+# 通常参加時のランダムテレポート
+regular-join-teleport: true 

@@ -53,6 +53,11 @@ public class ConfigManager {
         return value != null ? value.intValue() : defaultValue;
     }
 
+    public boolean getBoolean(String key, boolean defaultValue) {
+        Boolean value = config.getBoolean(key);
+        return value != null ? value : defaultValue;
+    }
+
     public Toml getTable(String key) {
         return config.getTable(key);
     }
