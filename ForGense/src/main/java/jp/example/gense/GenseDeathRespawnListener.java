@@ -34,7 +34,15 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
     private static final String QUERY_GAMEMODE_SUBCHANNEL = "query_gamemode";
     private static final String GAMEMODE_RESPONSE_SUBCHANNEL = "gamemode_response";
     private static final String JIGOKU_TRANSFER_SUBCHANNEL = "jigoku_transfer";
+    private static final String ADMIN_JIGOKU_TRANSFER_SUBCHANNEL = "admin_jigoku_transfer";
     private static final String GAMEMODE_UPDATE_SUBCHANNEL = "gamemode_update";
+    private static final String TRANSFER_ACK_SUBCHANNEL = "transfer_ack";
+
+    private static final String ACK_OK = "OK";
+    private static final String ACK_BANNED = "BANNED";
+    private static final String ACK_NIGHT = "NIGHT";
+    private static final String ACK_NO_SERVER = "NO_SERVER";
+    private static final String ACK_CONNECT_FAILED = "CONNECT_FAILED";
     
     private HuskSyncHook huskSyncHook;
     private final Map<UUID, Long> jigokuCooldownMap = new ConcurrentHashMap<>();
@@ -105,8 +113,42 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
             case QUERY_GAMEMODE_SUBCHANNEL:
                 handleGameModeQuery(in);
                 break;
+            case TRANSFER_ACK_SUBCHANNEL:
+                handleTransferAck(in);
+                break;
             default:
                 getLogger().warning("未知のサブチャンネル: " + subChannel);
+        }
+    }
+
+    private void handleTransferAck(ByteArrayDataInput in) {
+        UUID uuid = UUID.fromString(in.readUTF());
+        String status = in.readUTF();
+        String reason = in.readUTF();
+        Player player = Bukkit.getPlayer(uuid);
+        getLogger().info(String.format("[TransferAck] received uuid=%s status=%s reason=%s", uuid, status, reason));
+
+        if (player == null || !player.isOnline()) {
+            return;
+        }
+
+        switch (status) {
+            case ACK_OK:
+                applyJigokuCooldown(player);
+                if (jigokuTransferCooldownMillis > 0) {
+                    player.sendMessage(String.format("§7次に地獄へ転送できるまで: %s", formatDuration(jigokuTransferCooldownMillis)));
+                }
+                break;
+            case ACK_BANNED:
+            case ACK_NIGHT:
+                // 拒否理由は Velocity が既に通知済み。クールダウンは適用しない。
+                break;
+            case ACK_NO_SERVER:
+            case ACK_CONNECT_FAILED:
+                player.sendMessage("§c地獄サーバーへの接続に失敗しました。時間をおいて再度お試しください。");
+                break;
+            default:
+                getLogger().warning("[TransferAck] 未知ステータス: " + status);
         }
     }
 
@@ -197,37 +239,34 @@ public class GenseDeathRespawnListener extends JavaPlugin implements PluginMessa
 
     private void requestJigokuTransfer(Player player) {
         player.sendMessage("§c地獄への転送を開始します...");
-        
-        // HuskSyncでプレイヤーデータを保存してから転送
-        huskSyncHook.savePlayerDataAndThen(player, () -> {
-            // データ保存完了後にVelocityに転送リクエストを送信
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF(JIGOKU_TRANSFER_SUBCHANNEL);
-            out.writeUTF(player.getUniqueId().toString());
-            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-            applyJigokuCooldown(player);
-            if (jigokuTransferCooldownMillis > 0) {
-                player.sendMessage(String.format("§7次に地獄へ転送できるまで: %s", formatDuration(jigokuTransferCooldownMillis)));
-            }
-            
-            getLogger().info("HuskSyncデータ保存完了後、地獄転送を実行: " + player.getName());
-        });
+        // クールダウンは Velocity の ACK 受信後に適用する（handleTransferAck 参照）
+        sendTransferRequest(player, JIGOKU_TRANSFER_SUBCHANNEL, "地獄転送");
     }
 
     private void requestAdminJigokuTransfer(Player player) {
         player.sendMessage("§a[管理者] 地獄への強制転送を開始します...");
-        
-        // HuskSyncでプレイヤーデータを保存してから転送
-        huskSyncHook.savePlayerDataAndThen(player, () -> {
-            // データ保存完了後にVelocityに転送リクエストを送信
-            ByteArrayDataOutput out = ByteStreams.newDataOutput();
-            out.writeUTF("admin_jigoku_transfer");
-            out.writeUTF(player.getUniqueId().toString());
-            player.sendPluginMessage(this, CHANNEL, out.toByteArray());
-            
-            getLogger().info("HuskSyncデータ保存完了後、管理者地獄転送を実行: " + player.getName());
-        });
+        sendTransferRequest(player, ADMIN_JIGOKU_TRANSFER_SUBCHANNEL, "管理者地獄転送");
         getLogger().info(String.format("[管理者転送] %s が地獄への強制転送を実行しました。", player.getName()));
+    }
+
+    private void sendTransferRequest(Player player, String subChannel, String label) {
+        huskSyncHook.savePlayerDataAndThen(player, () -> {
+            if (!player.isOnline()) {
+                getLogger().warning(label + ": プレイヤーが既にオフラインのため転送リクエスト送信をスキップ: " + player.getName());
+                return;
+            }
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF(subChannel);
+            out.writeUTF(player.getUniqueId().toString());
+            try {
+                player.sendPluginMessage(this, CHANNEL, out.toByteArray());
+                getLogger().info(String.format("[TransferCommand] %s plugin message sent player=%s subChannel=%s",
+                    label, player.getName(), subChannel));
+            } catch (Throwable t) {
+                getLogger().log(Level.SEVERE, "転送プラグインメッセージ送信に失敗: " + player.getName(), t);
+                player.sendMessage("§c内部エラーで転送リクエストを送信できませんでした。");
+            }
+        });
     }
 
     private void requestJigokuTime(Player player) {

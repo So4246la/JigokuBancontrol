@@ -6,13 +6,16 @@ import net.william278.husksync.user.BukkitUser;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 
 /**
  * HuskSync APIとの統合を管理するクラス
  */
 public class HuskSyncHook {
-    
+
+    private static final long SAVE_TIMEOUT_TICKS = 100L; // 5 秒 (20 tick/秒)
+
     private final JavaPlugin plugin;
     private BukkitHuskSyncAPI huskSyncAPI;
     private boolean enabled = false;
@@ -56,9 +59,24 @@ public class HuskSyncHook {
      * @param callback 保存完了後にメインスレッドで実行するコールバック
      */
     public void savePlayerDataAndThen(Player player, Runnable callback) {
+        final AtomicBoolean fired = new AtomicBoolean(false);
+        Runnable safeCallback = () -> {
+            if (fired.compareAndSet(false, true)) {
+                plugin.getServer().getScheduler().runTask(plugin, callback);
+            }
+        };
+
+        // 救命タイムアウト: SAVE_TIMEOUT_TICKS 経過してもコールバックが発火しなければ強制的に呼ぶ
+        plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
+            if (!fired.get()) {
+                plugin.getLogger().warning("HuskSync 保存処理がタイムアウトしました。転送を続行します: " + player.getName());
+            }
+            safeCallback.run();
+        }, SAVE_TIMEOUT_TICKS);
+
         if (!isEnabled()) {
             plugin.getLogger().warning("HuskSyncが利用できないため、データ保存をスキップします: " + player.getName());
-            plugin.getServer().getScheduler().runTask(plugin, callback);
+            safeCallback.run();
             return;
         }
 
@@ -66,45 +84,41 @@ public class HuskSyncHook {
             final BukkitUser bukkitUser = huskSyncAPI.getUser(player);
             plugin.getLogger().info("プレイヤーデータの非同期取得を開始: " + player.getName());
 
-            // 1. getCurrentDataで非同期にデータを取得する
             huskSyncAPI.getCurrentData(bukkitUser)
                 .whenComplete((optionalSnapshot, throwable) -> {
-                    // このブロックはgetCurrentDataの処理が完了した後に実行されます
+                    try {
+                        if (throwable != null) {
+                            plugin.getLogger().log(Level.WARNING, "HuskSyncデータの取得処理でエラーが発生しました: " + player.getName(), throwable);
+                            safeCallback.run();
+                            return;
+                        }
 
-                    // 2. データ取得中にエラーが発生した場合の処理
-                    if (throwable != null) {
-                        plugin.getLogger().log(Level.WARNING, "HuskSyncデータの取得処理でエラーが発生しました: " + player.getName(), throwable);
-                        // エラーが発生した場合も、コールバックは実行する
-                        plugin.getServer().getScheduler().runTask(plugin, callback);
-                        return;
-                    }
+                        if (optionalSnapshot.isPresent()) {
+                            final DataSnapshot.Unpacked snapshotToSave = optionalSnapshot.get();
+                            plugin.getLogger().info("データの取得が完了。保存処理に移行します: " + player.getName());
 
-                    // 3. 取得したデータ(Optional)を処理する
-                    if (optionalSnapshot.isPresent()) {
-                        // データが見つかった場合
-                        final DataSnapshot.Unpacked snapshotToSave = optionalSnapshot.get();
-                        plugin.getLogger().info("データの取得が完了。保存処理に移行します: " + player.getName());
-
-                        // 4. 取得したスナップショットをaddSnapshotで保存する
-                        huskSyncAPI.addSnapshot(bukkitUser, snapshotToSave, (savedUser, savedSnapshot) -> {
-                            // このブロックはaddSnapshotの保存が完了した後に実行されます
-                            plugin.getLogger().info("プレイヤーデータの保存が完了しました: " + savedUser.getUsername());
-
-                            // 5. 最終的なコールバックをメインスレッドで実行
-                            plugin.getServer().getScheduler().runTask(plugin, callback);
-                        });
-                    } else {
-                        // データが見つからなかった場合
-                        plugin.getLogger().warning("保存対象のHuskSyncデータが見つかりませんでした: " + player.getName());
-                        // データが無くても、一連の処理は完了したとみなしコールバックを実行
-                        plugin.getServer().getScheduler().runTask(plugin, callback);
+                            try {
+                                huskSyncAPI.addSnapshot(bukkitUser, snapshotToSave, (savedUser, savedSnapshot) -> {
+                                    plugin.getLogger().info("プレイヤーデータの保存が完了しました: " + savedUser.getUsername());
+                                    safeCallback.run();
+                                });
+                            } catch (Throwable t) {
+                                plugin.getLogger().log(Level.WARNING, "HuskSync addSnapshot 呼び出しに失敗: " + player.getName(), t);
+                                safeCallback.run();
+                            }
+                        } else {
+                            plugin.getLogger().warning("保存対象のHuskSyncデータが見つかりませんでした: " + player.getName());
+                            safeCallback.run();
+                        }
+                    } catch (Throwable t) {
+                        plugin.getLogger().log(Level.WARNING, "HuskSync whenComplete ハンドラで予期せぬエラー: " + player.getName(), t);
+                        safeCallback.run();
                     }
                 });
 
-        } catch (Exception e) {
-            // 同期的なAPI呼び出し(getUserなど)でエラーが発生した場合
-            plugin.getLogger().log(Level.WARNING, "HuskSync処理の準備中にエラーが発生: " + player.getName(), e);
-            plugin.getServer().getScheduler().runTask(plugin, callback);
+        } catch (Throwable t) {
+            plugin.getLogger().log(Level.WARNING, "HuskSync処理の準備中にエラーが発生: " + player.getName(), t);
+            safeCallback.run();
         }
     }
     

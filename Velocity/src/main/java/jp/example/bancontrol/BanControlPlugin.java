@@ -9,6 +9,7 @@ import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.player.ServerPostConnectEvent;
+import com.velocitypowered.api.proxy.ConnectionRequestBuilder;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.proxy.Player;
@@ -22,7 +23,7 @@ import org.slf4j.Logger;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
-import javax.inject.Inject;
+import com.google.inject.Inject;
 import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -34,6 +35,13 @@ import java.util.concurrent.*;
 public class BanControlPlugin {
 
     private static final MinecraftChannelIdentifier CHANNEL = MinecraftChannelIdentifier.create("myserver", "bancontrol");
+    private static final String TRANSFER_ACK_SUBCHANNEL = "transfer_ack";
+    private static final String ACK_STATUS_OK = "OK";
+    private static final String ACK_STATUS_BANNED = "BANNED";
+    private static final String ACK_STATUS_NIGHT = "NIGHT";
+    private static final String ACK_STATUS_NO_SERVER = "NO_SERVER";
+    private static final String ACK_STATUS_NO_PLAYER = "NO_PLAYER";
+    private static final String ACK_STATUS_CONNECT_FAILED = "CONNECT_FAILED";
     private static final long NIGHT_START = 13000L;  // 12000L から 13000L に変更
     private static final long NIGHT_END = 23000L;   // 24000L から 23000L に変更
     private static final long DAY_TIME = 24000L;
@@ -315,15 +323,19 @@ public class BanControlPlugin {
     private void handlePluginMessage(String subChannel, ByteArrayDataInput in, PluginMessageEvent event) {
         switch (subChannel) {
             case "jigoku_transfer":
+                event.setResult(PluginMessageEvent.ForwardResult.handled());
                 handleJigokuTransfer(in);
                 break;
             case "gense_transfer":
+                event.setResult(PluginMessageEvent.ForwardResult.handled());
                 handleGenseTransfer(in);
                 break;
             case "admin_jigoku_transfer":
+                event.setResult(PluginMessageEvent.ForwardResult.handled());
                 handleAdminJigokuTransfer(in);
                 break;
             case "admin_gense_transfer":
+                event.setResult(PluginMessageEvent.ForwardResult.handled());
                 handleAdminGenseTransfer(in);
                 break;
             case "gamemode_update":
@@ -355,42 +367,90 @@ public class BanControlPlugin {
 
     private void handleJigokuTransfer(ByteArrayDataInput in) {
         UUID uuid = UUID.fromString(in.readUTF());
-        server.getPlayer(uuid).ifPresent(player -> {
-            // 先にBAN確認（夜間ログアウトなどで地獄行きを制限したい想定）
-            if (checkAndNotifyBan(player, uuid)) {
-                logger.debug("[Transfer] jigoku_transfer blocked by ban uuid={}", uuid);
-                return;
-            }
-            // 時刻チェック
-            if (isJigokuNight()) {
-                player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
-                if (debugMode) logger.info("[DEBUG][Transfer] jigoku_transfer blocked by night uuid={}", uuid);
-                return;
-            }
+        Optional<Player> playerOpt = server.getPlayer(uuid);
+        if (playerOpt.isEmpty()) {
+            logger.warn("[Transfer] jigoku_transfer: player not found uuid={}", uuid);
+            return;
+        }
+        Player player = playerOpt.get();
 
-            if (debugMode) logger.info("[DEBUG][Transfer] jigoku_transfer allowed uuid={}", uuid);
-            transferToServer(player, getJigokuServerName());
-        });
+        if (checkAndNotifyBan(player, uuid)) {
+            logger.info("[Transfer] jigoku_transfer blocked by ban uuid={}", uuid);
+            sendTransferAck(player, uuid, ACK_STATUS_BANNED, "ban");
+            return;
+        }
+        if (isJigokuNight()) {
+            player.sendMessage(Component.text("§c夜の地獄は危険すぎるため、移動できません。"));
+            if (debugMode) logger.info("[DEBUG][Transfer] jigoku_transfer blocked by night uuid={}", uuid);
+            sendTransferAck(player, uuid, ACK_STATUS_NIGHT, "night");
+            return;
+        }
+
+        if (debugMode) logger.info("[DEBUG][Transfer] jigoku_transfer allowed uuid={}", uuid);
+        transferToServer(player, getJigokuServerName(), true);
     }
 
     private void handleGenseTransfer(ByteArrayDataInput in) {
         UUID uuid = UUID.fromString(in.readUTF());
-        server.getPlayer(uuid).ifPresent(player -> {
-            // GenseへはBAN解除後に戻れる想定ならBANチェックを外す（必要なら再度有効化）
-            if (debugMode) logger.info("[DEBUG][Transfer] gense_transfer processing uuid={} (no ban gate)", uuid);
-            transferToServer(player, getGenseServerName());
+        Optional<Player> playerOpt = server.getPlayer(uuid);
+        if (playerOpt.isEmpty()) {
+            logger.warn("[Transfer] gense_transfer: player not found uuid={}", uuid);
+            return;
+        }
+        Player player = playerOpt.get();
+        if (debugMode) logger.info("[DEBUG][Transfer] gense_transfer processing uuid={} (no ban gate)", uuid);
+        transferToServer(player, getGenseServerName(), false);
+    }
+
+    private void transferToServer(Player player, String serverName) {
+        transferToServer(player, serverName, false);
+    }
+
+    // connect() で結果を観測し、必要なら ACK を返す。sendAckOnSuccess=true のときは成功時にも OK を返してクールダウン適用を促す
+    private void transferToServer(Player player, String serverName, boolean sendAckOnSuccess) {
+        UUID uuid = player.getUniqueId();
+        Optional<com.velocitypowered.api.proxy.server.RegisteredServer> targetOpt = server.getServer(serverName);
+        if (targetOpt.isEmpty()) {
+            player.sendMessage(Component.text("§c転送先のサーバーが見つかりません: " + serverName));
+            logger.error("[Transfer] サーバーが見つかりません: {}", serverName);
+            if (sendAckOnSuccess) sendTransferAck(player, uuid, ACK_STATUS_NO_SERVER, "missing-server:" + serverName);
+            return;
+        }
+
+        if (sendAckOnSuccess) {
+            // 成功を見越して先に ACK を送る（プレイヤーがまだ元のサーバーに居る間に届くように同期送信）
+            sendTransferAck(player, uuid, ACK_STATUS_OK, "");
+        }
+
+        player.createConnectionRequest(targetOpt.get()).connect().whenComplete((result, throwable) -> {
+            if (throwable != null) {
+                logger.error("[Transfer] connect() でエラー uuid={} server={}", uuid, serverName, throwable);
+                if (sendAckOnSuccess) sendTransferAck(player, uuid, ACK_STATUS_CONNECT_FAILED, "exception:" + throwable.getClass().getSimpleName());
+                return;
+            }
+            ConnectionRequestBuilder.Status status = result.getStatus();
+            if (debugMode) logger.info("[Transfer] connect() result uuid={} server={} status={}", uuid, serverName, status);
+            if (status != ConnectionRequestBuilder.Status.SUCCESS && status != ConnectionRequestBuilder.Status.ALREADY_CONNECTED) {
+                String reason = result.getReasonComponent()
+                    .map(net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer.plainText()::serialize)
+                    .orElse(status.name());
+                player.sendMessage(Component.text("§c転送に失敗しました: " + reason));
+                logger.warn("[Transfer] 転送失敗 uuid={} server={} status={} reason={}", uuid, serverName, status, reason);
+                if (sendAckOnSuccess) sendTransferAck(player, uuid, ACK_STATUS_CONNECT_FAILED, status.name());
+            }
         });
     }
 
-    // 共通のサーバー転送メソッド
-    private void transferToServer(Player player, String serverName) {
-        server.getServer(serverName).ifPresentOrElse(
-            target -> player.createConnectionRequest(target).fireAndForget(),
-            () -> {
-                player.sendMessage(Component.text("§c転送先のサーバーが見つかりません: " + serverName));
-                logger.error("サーバーが見つかりません: " + serverName);
-            }
-        );
+    private void sendTransferAck(Player player, UUID uuid, String status, String reason) {
+        player.getCurrentServer().ifPresentOrElse(connection -> {
+            ByteArrayDataOutput out = ByteStreams.newDataOutput();
+            out.writeUTF(TRANSFER_ACK_SUBCHANNEL);
+            out.writeUTF(uuid.toString());
+            out.writeUTF(status);
+            out.writeUTF(reason == null ? "" : reason);
+            connection.sendPluginMessage(CHANNEL, out.toByteArray());
+            if (debugMode) logger.info("[TransferAck] sent uuid={} status={} reason={} to={}", uuid, status, reason, connection.getServerInfo().getName());
+        }, () -> logger.warn("[TransferAck] プレイヤーの現在のサーバーが取得できないため ACK を送信できません uuid={}", uuid));
     }
 
     // BANチェックの共通化
